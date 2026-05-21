@@ -261,26 +261,86 @@ def _extend_centerline(centerline: np.ndarray, tangent: np.ndarray, extension_mm
     return np.vstack([pre, centerline, post]), np.vstack([pre_t, tangent, post_t])
 
 
-def _anchors_by_arch_position(centroids: list[ToothCentroid], down_axis: np.ndarray) -> np.ndarray:
-    """Build one arch anchor per FDI position by averaging present upper+lower teeth.
+def _anchors_by_arch_position(
+    centroids: list[ToothCentroid], down_axis: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build one voxel-weighted anchor per FDI position.
 
-    The anchors are returned already projected to the axial plane (the
-    supero-inferior component is removed) so the spline lives at the mean
-    occlusal height set by ``fit_unified_arch``.
+    For every position that has at least one segmented tooth, the anchor is the
+    voxel-count-weighted mean of the present teeth's world centroids. Under-
+    segmented teeth (e.g. peg-shaped remnants) therefore contribute less than
+    full-size co-located teeth, instead of dragging the anchor toward their
+    noisy centre. Returns (positions, anchors_world) already projected to the
+    axial plane so the spline lives at the mean occlusal height set by
+    ``fit_unified_arch``.
     """
-    by_position: dict[int, list[np.ndarray]] = {}
+    by_position: dict[int, list[tuple[np.ndarray, float]]] = {}
     for c in centroids:
         pos = LABEL_TO_ARCH_POSITION.get(int(c.label))
         if pos is None:
             continue
-        by_position.setdefault(pos, []).append(np.asarray(c.world, dtype=np.float64))
+        by_position.setdefault(pos, []).append(
+            (np.asarray(c.world, dtype=np.float64), float(max(c.voxel_count, 1)))
+        )
     if not by_position:
-        return np.empty((0, 3), dtype=np.float64)
-    means = np.array(
-        [np.mean(np.stack(by_position[pos], axis=0), axis=0) for pos in sorted(by_position.keys())],
-        dtype=np.float64,
-    )
-    return _project_to_axial(means, down_axis)
+        return np.empty((0,), dtype=np.int64), np.empty((0, 3), dtype=np.float64)
+    positions = np.array(sorted(by_position.keys()), dtype=np.int64)
+    anchors = []
+    for pos in positions:
+        entries = by_position[int(pos)]
+        coords = np.stack([e[0] for e in entries], axis=0)
+        weights = np.array([e[1] for e in entries], dtype=np.float64)
+        anchors.append((coords * weights[:, None]).sum(axis=0) / weights.sum())
+    anchors_world = _project_to_axial(np.array(anchors, dtype=np.float64), down_axis)
+    return positions, anchors_world
+
+
+def _patch_outlier_anchors(
+    positions: np.ndarray, pts_2d: np.ndarray, k_mad: float = 4.0, min_threshold_mm: float = 4.0
+) -> tuple[np.ndarray, list[int]]:
+    """Replace anchors whose axial position deviates from a global smoothing
+    spline through all anchors by more than ``k_mad`` × MAD of the residuals.
+
+    A degree-3 smoothing spline (UnivariateSpline) is fit per axial dimension
+    against the anchor *position index* (0..15 across the FDI sequence). Because
+    every anchor is included in the fit, endpoints don't suffer the
+    extrapolation pathology that leave-one-out parabolas show on U-shaped
+    arches. With strong smoothing, a single mis-positioned anchor (e.g. F_001's
+    tiny tooth 27 leaning lingually) shifts the curve only marginally, so its
+    residual stands out and the rule patches it cleanly. ``min_threshold_mm``
+    keeps clean fits from flagging false outliers when the global MAD is
+    already small.
+    """
+    if len(positions) < 5:
+        return pts_2d, []
+
+    x = positions.astype(np.float64)
+    span = float(x[-1] - x[0])
+    # Strong smoothing target: the spline shouldn't track per-anchor noise.
+    # s ≈ N × (1.5 mm)² keeps the fit close enough to the data while ignoring
+    # millimeter-scale jitter; tuned empirically against the bundled cases.
+    smoothing_s = max(1.0, len(x) * 1.5 ** 2)
+    k = min(3, len(x) - 1)
+    try:
+        from scipy.interpolate import UnivariateSpline
+        sp_e1 = UnivariateSpline(x, pts_2d[:, 0], k=k, s=smoothing_s)
+        sp_e2 = UnivariateSpline(x, pts_2d[:, 1], k=k, s=smoothing_s)
+        pred = np.column_stack([sp_e1(x), sp_e2(x)])
+    except Exception:
+        return pts_2d, []
+
+    resid = np.linalg.norm(pts_2d - pred, axis=1)
+    median_resid = float(np.median(resid))
+    mad = float(np.median(np.abs(resid - median_resid))) * 1.4826
+    threshold = max(float(k_mad) * mad, float(min_threshold_mm))
+
+    new_pts = pts_2d.copy()
+    replaced: list[int] = []
+    for i in range(len(positions)):
+        if resid[i] > threshold:
+            new_pts[i] = pred[i]
+            replaced.append(int(positions[i]))
+    return new_pts, replaced
 
 
 def fit_unified_arch(
@@ -289,24 +349,30 @@ def fit_unified_arch(
     if len(centroids) < 4:
         raise RuntimeError(f"Need at least 4 tooth centroids to fit an arch, got {len(centroids)}.")
 
-    sorted_axial = _anchors_by_arch_position(centroids, down_axis)
-    if len(sorted_axial) < 4:
-        raise RuntimeError(f"Only {len(sorted_axial)} arch positions present; need at least 4 for a stable spline.")
+    positions, anchors_world = _anchors_by_arch_position(centroids, down_axis)
+    if len(positions) < 4:
+        raise RuntimeError(f"Only {len(positions)} arch positions present; need at least 4 for a stable spline.")
 
     e1, e2 = _build_axial_basis(down_axis)
+    pts_2d = np.column_stack([anchors_world @ e1, anchors_world @ e2])
 
-    # Drop duplicates / near-zero gaps that could destabilise splprep.
-    kept = [sorted_axial[0]]
-    for p in sorted_axial[1:]:
-        if np.linalg.norm(p - kept[-1]) >= 0.5:
-            kept.append(p)
-    sorted_axial = np.array(kept, dtype=np.float64)
+    # Patch outlier anchors (e.g. tiny mis-segmented teeth) by comparing each
+    # anchor to a smoothing-spline trend through all the anchors. Tracked in
+    # residuals for QC.
+    pts_2d, replaced_positions = _patch_outlier_anchors(positions, pts_2d)
 
-    trimmed, dropped_start, dropped_end = _drop_terminal_gap_outliers(sorted_axial, config)
+    # Drop near-duplicate adjacent points that would destabilise splprep.
+    kept_indices = [0]
+    for i in range(1, len(pts_2d)):
+        if np.linalg.norm(pts_2d[i] - pts_2d[kept_indices[-1]]) >= 0.5:
+            kept_indices.append(i)
+    pts_2d = pts_2d[kept_indices]
+
+    trimmed, dropped_start, dropped_end = _drop_terminal_gap_outliers(pts_2d, config)
     if len(trimmed) >= 5:
-        sorted_axial = trimmed
+        pts_2d = trimmed
 
-    arc_length = float(np.sum(np.linalg.norm(np.diff(sorted_axial, axis=0), axis=1)))
+    arc_length = float(np.sum(np.linalg.norm(np.diff(pts_2d, axis=0), axis=1)))
     if config.spline_smoothing is None:
         smoothing = max(1.0, arc_length / 40.0)
     else:
@@ -315,7 +381,6 @@ def fit_unified_arch(
     # Fit the spline in 2-D (axial plane) — we restore the vertical
     # component as a constant offset (the mean V) so that the sampling
     # plane normal is purely horizontal.
-    pts_2d = np.column_stack([sorted_axial @ e1, sorted_axial @ e2])
     k = min(3, len(pts_2d) - 1)
     tck, _ = splprep(pts_2d.T, s=smoothing, k=k)
     u_eval = np.linspace(0.0, 1.0, int(config.spline_resolution))
@@ -346,6 +411,8 @@ def fit_unified_arch(
         "max_axial_mm": float(np.max(distances)),
         "mean_axial_mm": float(np.mean(distances)),
         "dropped_terminal_outliers": int(dropped_start + dropped_end),
+        "replaced_positions": [int(p) for p in replaced_positions],
+        "anchor_positions": [int(p) for p in positions],
         "arc_length_mm": arc_length,
         "smoothing": float(smoothing),
     }
