@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Data — kept local, not in history
+raw/
+seg/
+
+# Run outputs (regenerable)
+outputs/
+
+# Interim artefacts
+*.npy
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
