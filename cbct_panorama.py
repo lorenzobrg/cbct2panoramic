@@ -71,7 +71,7 @@ class PanoramaConfig:
     slab_half_width_mm: float = 7.0
     vertical_margin_mm: float = 6.0
     endpoint_extension_mm: float = 18.0
-    projection_mode: str = "mip"            # mip | percentile | mean
+    projection_mode: str = "xray"           # xray | mip | percentile | mean
     projection_percentile: float = 96.0
     intensity_clip_low_pct: float = 0.5
     intensity_clip_high_pct: float = 99.7
@@ -493,6 +493,14 @@ def compute_vertical_range(
 
 def _project_slab(sampled: np.ndarray, config: PanoramaConfig) -> np.ndarray:
     mode = config.projection_mode.lower()
+    if mode == "xray":
+        # Simulated X-ray: integrate (HU + 1000) along the slab so each voxel
+        # contributes its relative density. Path-integrated attenuation
+        # preserves both bright structures (enamel, cortex) and dark cavities
+        # (pulp, mandibular canal, marrow) — clinical OPG appearance. MIP
+        # discards every voxel except the brightest and erases the cavities.
+        attenuation = np.maximum(sampled + 1000.0, 0.0)
+        return attenuation.mean(axis=1).astype(np.float32, copy=False)
     if mode == "mip":
         return sampled.max(axis=1)
     if mode == "percentile":
@@ -799,7 +807,7 @@ def main() -> None:
     parser.add_argument("--slab-half-width-mm", type=float, default=PanoramaConfig.slab_half_width_mm)
     parser.add_argument("--vertical-margin-mm", type=float, default=PanoramaConfig.vertical_margin_mm)
     parser.add_argument("--endpoint-extension-mm", type=float, default=PanoramaConfig.endpoint_extension_mm)
-    parser.add_argument("--projection-mode", choices=("mip", "percentile", "mean"), default=PanoramaConfig.projection_mode)
+    parser.add_argument("--projection-mode", choices=("xray", "mip", "percentile", "mean"), default=PanoramaConfig.projection_mode)
     parser.add_argument("--projection-percentile", type=float, default=PanoramaConfig.projection_percentile)
     parser.add_argument("--no-clahe", action="store_true")
     parser.add_argument("--clahe-clip-limit", type=float, default=PanoramaConfig.clahe_clip_limit)

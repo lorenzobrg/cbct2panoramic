@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--slab-half-width-mm", type=float, default=PanoramaConfig.slab_half_width_mm)
     parser.add_argument("--vertical-margin-mm", type=float, default=PanoramaConfig.vertical_margin_mm)
     parser.add_argument("--endpoint-extension-mm", type=float, default=PanoramaConfig.endpoint_extension_mm)
-    parser.add_argument("--projection-mode", choices=("mip", "percentile", "mean"), default=PanoramaConfig.projection_mode)
+    parser.add_argument("--projection-mode", choices=("xray", "mip", "percentile", "mean"), default=PanoramaConfig.projection_mode)
     parser.add_argument("--projection-percentile", type=float, default=PanoramaConfig.projection_percentile)
     parser.add_argument("--spline-resolution", type=int, default=PanoramaConfig.spline_resolution)
     parser.add_argument("--spline-smoothing", type=float, default=None)
