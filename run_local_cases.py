@@ -78,6 +78,7 @@ def main() -> None:
             "sampling_qc": {
                 k: report["sampling_qc"][k] for k in (
                     "height_pixels", "columns", "v_min_mm", "v_max_mm",
+                    "v_upper_rel_mm", "v_lower_rel_mm",
                     "out_of_bounds_fraction", "cropped_top_rows", "cropped_bottom_rows",
                     "height_pixels_after_crop",
                 ) if k in report["sampling_qc"]

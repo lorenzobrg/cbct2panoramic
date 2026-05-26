@@ -77,6 +77,8 @@ class PanoramaConfig:
     intensity_clip_high_pct: float = 99.7
     apply_clahe: bool = True
     clahe_clip_limit: float = 0.01
+    unsharp_amount: float = 0.45
+    unsharp_sigma_px: float = 4.0
     crop_oob_threshold: float = 0.75
     crop_margin_rows: int = 6
     flip_horizontal: bool = True
@@ -98,12 +100,29 @@ class ToothCentroid:
 
 @dataclass
 class ArchGeometry:
-    centerline_world: np.ndarray   # (N, 3)
-    tangent: np.ndarray            # (N, 3) — unit, in axial plane
-    width_axis: np.ndarray         # (N, 3) — unit, in axial plane (perpendicular)
-    vertical_axis: np.ndarray      # (3,)   — constant, supero-inferior
-    residuals_mm: dict[str, float]
+    # Column index ``c`` always refers to a position on the *unified* arch curve
+    # (the same curve the original single-arch pipeline used), so columns remain
+    # in correspondence across the whole panorama. The dual-arch behavior is
+    # encoded as per-column *lateral offsets* along ``width_axis``: at column c,
+    # the upper arch sits ``lateral_offset_upper_mm[c]`` away from the unified
+    # curve and the lower arch sits ``lateral_offset_lower_mm[c]`` away — both
+    # measured in the axial plane. ``sample_panorama`` blends these two offsets
+    # by V so upper-tooth-band rows sample the upper-arch position and lower-
+    # tooth-band rows sample the lower-arch position.
+    centerline_world: np.ndarray         # (N, 3) unified curve, in 3D
+    tangent: np.ndarray                  # (N, 3) unit, in axial plane
+    width_axis: np.ndarray               # (N, 3) unit, in axial plane (perpendicular)
+    vertical_axis: np.ndarray            # (3,)   supero-inferior
+    lateral_offset_upper_mm: np.ndarray  # (N,)
+    lateral_offset_lower_mm: np.ndarray  # (N,)
+    v_upper_mm: float                    # mean V of upper arch (world)
+    v_lower_mm: float                    # mean V of lower arch
+    residuals_mm: dict[str, Any]
     vertical_range_mm: tuple[float, float]
+    # Per-arch curves kept around so debug plots can show them; not used by the
+    # main sampler.
+    upper_centerline_world: np.ndarray
+    lower_centerline_world: np.ndarray
 
 
 # -- generic helpers ---------------------------------------------------------
@@ -199,15 +218,25 @@ def extract_tooth_centroids(seg: np.ndarray, affine: np.ndarray, config: Panoram
     return centroids
 
 
-def estimate_down_axis(centroids: list[ToothCentroid], affine: np.ndarray) -> np.ndarray:
+def estimate_down_axis(
+    centroids: list[ToothCentroid],
+    affine: np.ndarray,
+    seg: np.ndarray | None = None,
+) -> np.ndarray:
+    # Use the upper-vs-lower tooth centroid difference. Jaw-label centroids
+    # (mandible vs maxilla) sound more robust but in practice the mandible
+    # extends ~50 mm posteriorly via the rami while the maxilla doesn't, so
+    # mean(mandible) − mean(maxilla) is heavily tilted in the AP direction —
+    # tested on P_489 it deviates ~40° from the actual supero-inferior axis
+    # and makes the slab walk diagonally through the head. The tooth centroids
+    # are anatomically near each other on both arches, so their difference
+    # vector is close to the true SI direction.
     upper = np.array([c.world for c in centroids if c.arch == "upper"], dtype=np.float64)
     lower = np.array([c.world for c in centroids if c.arch == "lower"], dtype=np.float64)
     if len(upper) and len(lower):
         down = lower.mean(axis=0) - upper.mean(axis=0)
         if np.linalg.norm(down) > 1e-6:
             return _normalize(down)
-    # Single-arch fallback — affine axis 2 is the upper-to-lower direction
-    # in the bundled ToothFairy NIfTIs.
     return _normalize(affine[:3, 2])
 
 
@@ -343,78 +372,184 @@ def _patch_outlier_anchors(
     return new_pts, replaced
 
 
+@dataclass
+class _BaseArchFit:
+    centerline: np.ndarray   # (N, 3) world, V offset already applied
+    tangent: np.ndarray      # (N, 3) unit, in axial plane
+    mean_step_mm: float
+    mean_v_world: float
+    residuals: dict[str, Any]
+    centroid_world: np.ndarray
+
+
+def _fit_arch_base(
+    centroids_subset: list[ToothCentroid],
+    down_axis: np.ndarray,
+    e1: np.ndarray,
+    e2: np.ndarray,
+    config: PanoramaConfig,
+) -> _BaseArchFit | None:
+    if len(centroids_subset) < 4:
+        return None
+
+    positions, anchors_world = _anchors_by_arch_position(centroids_subset, down_axis)
+    if len(positions) < 4:
+        return None
+
+    pts_2d = np.column_stack([anchors_world @ e1, anchors_world @ e2])
+    pts_2d, replaced_positions = _patch_outlier_anchors(positions, pts_2d)
+
+    kept_indices = [0]
+    for i in range(1, len(pts_2d)):
+        if np.linalg.norm(pts_2d[i] - pts_2d[kept_indices[-1]]) >= 0.5:
+            kept_indices.append(i)
+    pts_2d = pts_2d[kept_indices]
+    kept_positions = positions[kept_indices]
+
+    trimmed, dropped_start, dropped_end = _drop_terminal_gap_outliers(pts_2d, config)
+    if len(trimmed) >= 5:
+        pts_2d = trimmed
+        kept_positions = kept_positions[dropped_start: len(kept_positions) - dropped_end]
+
+    arc_length = float(np.sum(np.linalg.norm(np.diff(pts_2d, axis=0), axis=1)))
+    smoothing = max(1.0, arc_length / 40.0) if config.spline_smoothing is None else float(config.spline_smoothing)
+
+    k = min(3, len(pts_2d) - 1)
+    tck, _ = splprep(pts_2d.T, s=smoothing, k=k)
+    u_eval = np.linspace(0.0, 1.0, int(config.spline_resolution))
+    curve_2d = np.array(splev(u_eval, tck), dtype=np.float64).T
+    deriv_2d = np.array(splev(u_eval, tck, der=1), dtype=np.float64).T
+
+    centerline = curve_2d[:, 0:1] * e1[None, :] + curve_2d[:, 1:2] * e2[None, :]
+    centroid_world = np.array([c.world for c in centroids_subset], dtype=np.float64)
+    mean_v = float(np.mean(centroid_world @ down_axis))
+    centerline = centerline + mean_v * down_axis[None, :]
+    tangent = _normalize(deriv_2d[:, 0:1] * e1[None, :] + deriv_2d[:, 1:2] * e2[None, :])
+
+    mean_step = float(np.mean(np.linalg.norm(np.diff(centerline, axis=0), axis=1)))
+    if not np.isfinite(mean_step) or mean_step <= 1e-6:
+        mean_step = float(arc_length) / max(len(centerline) - 1, 1)
+
+    residuals = {
+        "dropped_terminal_outliers": int(dropped_start + dropped_end),
+        "replaced_positions": [int(p) for p in replaced_positions],
+        "anchor_positions": [int(p) for p in kept_positions],
+        "arc_length_mm": arc_length,
+        "smoothing": float(smoothing),
+    }
+    return _BaseArchFit(
+        centerline=centerline,
+        tangent=tangent,
+        mean_step_mm=mean_step,
+        mean_v_world=mean_v,
+        residuals=residuals,
+        centroid_world=centroid_world,
+    )
+
+
+def _extend_with_count(
+    centerline: np.ndarray, tangent: np.ndarray, n_ext: int, step_mm: float
+) -> tuple[np.ndarray, np.ndarray]:
+    if n_ext <= 0 or len(centerline) < 2 or step_mm <= 1e-6:
+        return centerline, tangent
+    distances = np.arange(n_ext, dtype=np.float64) * step_mm + step_mm
+    pre = centerline[0][None, :] - distances[::-1, None] * tangent[0][None, :]
+    post = centerline[-1][None, :] + distances[:, None] * tangent[-1][None, :]
+    pre_t = np.repeat(tangent[0][None, :], n_ext, axis=0)
+    post_t = np.repeat(tangent[-1][None, :], n_ext, axis=0)
+    return np.vstack([pre, centerline, post]), np.vstack([pre_t, tangent, post_t])
+
+
+def _finalize_arch(
+    base: _BaseArchFit,
+    down_axis: np.ndarray,
+    n_ext: int,
+    step_mm: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, dict[str, Any]]:
+    centerline, tangent = _extend_with_count(base.centerline, base.tangent, n_ext, step_mm)
+    vertical_axis = _normalize(down_axis)
+    width_axis = _normalize(np.cross(vertical_axis[None, :].repeat(len(tangent), axis=0), tangent))
+
+    centroid_axial = _project_to_axial(base.centroid_world, vertical_axis)
+    centerline_axial = _project_to_axial(centerline, vertical_axis)
+    tree = cKDTree(centerline_axial)
+    distances = tree.query(centroid_axial, k=1)[0]
+    residuals = dict(base.residuals)
+    residuals["max_axial_mm"] = float(np.max(distances))
+    residuals["mean_axial_mm"] = float(np.mean(distances))
+    return centerline, tangent, width_axis, base.mean_v_world, residuals
+
+
 def fit_unified_arch(
     centroids: list[ToothCentroid], down_axis: np.ndarray, config: PanoramaConfig
 ) -> ArchGeometry:
     if len(centroids) < 4:
         raise RuntimeError(f"Need at least 4 tooth centroids to fit an arch, got {len(centroids)}.")
 
-    positions, anchors_world = _anchors_by_arch_position(centroids, down_axis)
-    if len(positions) < 4:
-        raise RuntimeError(f"Only {len(positions)} arch positions present; need at least 4 for a stable spline.")
-
     e1, e2 = _build_axial_basis(down_axis)
-    pts_2d = np.column_stack([anchors_world @ e1, anchors_world @ e2])
+    upper_centroids = [c for c in centroids if c.arch == "upper"]
+    lower_centroids = [c for c in centroids if c.arch == "lower"]
 
-    # Patch outlier anchors (e.g. tiny mis-segmented teeth) by comparing each
-    # anchor to a smoothing-spline trend through all the anchors. Tracked in
-    # residuals for QC.
-    pts_2d, replaced_positions = _patch_outlier_anchors(positions, pts_2d)
+    unified_base = _fit_arch_base(centroids, down_axis, e1, e2, config)
+    if unified_base is None:
+        raise RuntimeError("Not enough arch positions for a stable spline.")
+    upper_base = _fit_arch_base(upper_centroids, down_axis, e1, e2, config)
+    lower_base = _fit_arch_base(lower_centroids, down_axis, e1, e2, config)
 
-    # Drop near-duplicate adjacent points that would destabilise splprep.
-    kept_indices = [0]
-    for i in range(1, len(pts_2d)):
-        if np.linalg.norm(pts_2d[i] - pts_2d[kept_indices[-1]]) >= 0.5:
-            kept_indices.append(i)
-    pts_2d = pts_2d[kept_indices]
-
-    trimmed, dropped_start, dropped_end = _drop_terminal_gap_outliers(pts_2d, config)
-    if len(trimmed) >= 5:
-        pts_2d = trimmed
-
-    arc_length = float(np.sum(np.linalg.norm(np.diff(pts_2d, axis=0), axis=1)))
-    if config.spline_smoothing is None:
-        smoothing = max(1.0, arc_length / 40.0)
-    else:
-        smoothing = float(config.spline_smoothing)
-
-    # Fit the spline in 2-D (axial plane) — we restore the vertical
-    # component as a constant offset (the mean V) so that the sampling
-    # plane normal is purely horizontal.
-    k = min(3, len(pts_2d) - 1)
-    tck, _ = splprep(pts_2d.T, s=smoothing, k=k)
-    u_eval = np.linspace(0.0, 1.0, int(config.spline_resolution))
-    curve_2d = np.array(splev(u_eval, tck), dtype=np.float64).T   # (N, 2)
-    deriv_2d = np.array(splev(u_eval, tck, der=1), dtype=np.float64).T  # (N, 2)
-
-    centerline = curve_2d[:, 0:1] * e1[None, :] + curve_2d[:, 1:2] * e2[None, :]
-    # Anchor the centerline at the mean V of the tooth centroids so the strip
-    # is roughly centred on the dentition occlusal plane.
-    centroid_world = np.array([c.world for c in centroids], dtype=np.float64)
-    mean_v = float(np.mean(centroid_world @ down_axis))
-    centerline = centerline + mean_v * down_axis[None, :]
-    tangent = _normalize(deriv_2d[:, 0:1] * e1[None, :] + deriv_2d[:, 1:2] * e2[None, :])
-
-    centerline, tangent = _extend_centerline(centerline, tangent, config.endpoint_extension_mm)
-    # Vertical axis is constant (supero-inferior). U = V × T (in-axial perpendicular).
+    n_ext = (
+        max(1, int(math.ceil(config.endpoint_extension_mm / max(unified_base.mean_step_mm, 1e-6))))
+        if config.endpoint_extension_mm > 0 else 0
+    )
+    centerline, tangent, width_axis, _v_mean, unified_resid = _finalize_arch(
+        unified_base, down_axis, n_ext, unified_base.mean_step_mm
+    )
     vertical_axis = _normalize(down_axis)
-    width_axis = _normalize(np.cross(vertical_axis[None, :].repeat(len(tangent), axis=0), tangent))
 
-    # Residuals measured in the axial plane only — the spline lives at a single
-    # vertical anchor by design, so a 3D distance would be dominated by the
-    # upper/lower-arch height difference rather than any fit error.
-    centroid_axial = _project_to_axial(centroid_world, vertical_axis)
-    centerline_axial = _project_to_axial(centerline, vertical_axis)
-    tree = cKDTree(centerline_axial)
-    distances = tree.query(centroid_axial, k=1)[0]
+    # Project the unified centerline to the axial plane and find, for each
+    # column, the nearest point on each per-arch curve. The signed projection
+    # of that displacement onto width_axis is the lateral offset; the tangent-
+    # direction component is folded into the column index via the nearest-
+    # neighbor lookup (so anchors that move along the arch still align).
+    unified_axial = _project_to_axial(centerline, vertical_axis)
+
+    def lateral_offsets(base: _BaseArchFit | None, fallback_v: float) -> tuple[np.ndarray, float]:
+        if base is None:
+            return np.zeros(len(centerline), dtype=np.float64), fallback_v
+        # Re-extend the per-arch base at the same shared step so its sampling
+        # density matches the unified extension footprint.
+        arch_centerline, _, _, mean_v, _ = _finalize_arch(base, down_axis, n_ext, unified_base.mean_step_mm)
+        arch_axial = _project_to_axial(arch_centerline, vertical_axis)
+        tree = cKDTree(arch_axial)
+        _, idx = tree.query(unified_axial, k=1)
+        displacement = arch_axial[idx] - unified_axial             # (N, 3) axial-plane
+        offset = np.einsum("nd,nd->n", displacement, width_axis)   # signed scalar
+        # Real buccolingual offset between matching upper/lower teeth is ≤4 mm;
+        # tighter clamp prevents nearest-neighbor matches across the extension
+        # from dragging the slab off the dentition at the posterior columns.
+        return np.clip(offset, -4.0, 4.0), float(mean_v)
+
+    fallback_v = unified_base.mean_v_world
+    upper_offset, v_upper = lateral_offsets(upper_base, fallback_v)
+    lower_offset, v_lower = lateral_offsets(lower_base, fallback_v)
+
+    # Per-arch curves themselves (re-extended) for debug plots.
+    if upper_base is not None:
+        upper_curve, *_ = _finalize_arch(upper_base, down_axis, n_ext, unified_base.mean_step_mm)
+    else:
+        upper_curve = centerline.copy()
+    if lower_base is not None:
+        lower_curve, *_ = _finalize_arch(lower_base, down_axis, n_ext, unified_base.mean_step_mm)
+    else:
+        lower_curve = centerline.copy()
+
     residuals = {
-        "max_axial_mm": float(np.max(distances)),
-        "mean_axial_mm": float(np.mean(distances)),
-        "dropped_terminal_outliers": int(dropped_start + dropped_end),
-        "replaced_positions": [int(p) for p in replaced_positions],
-        "anchor_positions": [int(p) for p in positions],
-        "arc_length_mm": arc_length,
-        "smoothing": float(smoothing),
+        "unified": unified_resid,
+        "max_axial_mm": float(unified_resid["max_axial_mm"]),
+        "mean_axial_mm": float(unified_resid["mean_axial_mm"]),
+        "replaced_positions": list(unified_resid["replaced_positions"]),
+        "v_separation_mm": float(abs(v_lower - v_upper)),
+        "lateral_offset_upper_max_mm": float(np.max(np.abs(upper_offset))),
+        "lateral_offset_lower_max_mm": float(np.max(np.abs(lower_offset))),
     }
 
     return ArchGeometry(
@@ -422,8 +557,14 @@ def fit_unified_arch(
         tangent=tangent,
         width_axis=width_axis,
         vertical_axis=vertical_axis,
+        lateral_offset_upper_mm=upper_offset,
+        lateral_offset_lower_mm=lower_offset,
+        v_upper_mm=v_upper,
+        v_lower_mm=v_lower,
         residuals_mm=residuals,
         vertical_range_mm=(0.0, 0.0),  # placeholder, filled by compute_vertical_range
+        upper_centerline_world=upper_curve,
+        lower_centerline_world=lower_curve,
     )
 
 
@@ -447,34 +588,31 @@ def compute_vertical_range(
 ) -> ArchGeometry:
     coords = _coords_for_labels(seg, EXTENT_LABELS, config.max_extent_samples)
     down = geometry.vertical_axis
+    margin = float(config.vertical_margin_mm)
 
-    # Project every relevant voxel into mm along the down axis; v=0 is the
-    # mean tooth-centroid height (where the spline lives), so v<0 is above
-    # the occlusal plane and v>0 is below.
+    # v offsets are measured from the unified centerline V (the mean tooth V).
+    # Keeping this relative reference makes the slab span concentrate on the
+    # dentition rather than the whole skull height — critical with a properly-
+    # aligned down axis which otherwise lets EXTENT_LABELS span 100 mm.
+    v_center = float(np.mean(geometry.centerline_world @ down))
+
     if coords.size:
         world = _apply_affine(affine, coords)
-        v_values = world @ down
-        v_center = float(np.mean(geometry.centerline_world @ down))
-        rel = v_values - v_center
-        low = float(np.percentile(rel, 0.5)) - float(config.vertical_margin_mm)
-        high = float(np.percentile(rel, 99.5)) + float(config.vertical_margin_mm)
+        rel = world @ down - v_center
+        low = float(np.percentile(rel, 0.5)) - margin
+        high = float(np.percentile(rel, 99.5)) + margin
     else:
         low, high = -40.0, 40.0
 
-    # Clamp to the volume's actual extent so we don't waste rows on air.
     corners = np.array(
         [[i, j, k] for i in (0, raw_shape[0] - 1) for j in (0, raw_shape[1] - 1) for k in (0, raw_shape[2] - 1)],
         dtype=np.float64,
     )
     corners_world = _apply_affine(affine, corners)
-    v_corners = corners_world @ down
-    v_center = float(np.mean(geometry.centerline_world @ down))
-    v_min_vol = float(np.min(v_corners)) - v_center
-    v_max_vol = float(np.max(v_corners)) - v_center
-    low = max(low, v_min_vol)
-    high = min(high, v_max_vol)
+    v_corners = corners_world @ down - v_center
+    low = max(low, float(np.min(v_corners)))
+    high = min(high, float(np.max(v_corners)))
     if high - low < 30.0:
-        # Failsafe: still produce a usable slab even if the seg-derived range is tiny.
         mid = 0.5 * (low + high)
         low, high = mid - 30.0, mid + 30.0
 
@@ -483,24 +621,54 @@ def compute_vertical_range(
         tangent=geometry.tangent,
         width_axis=geometry.width_axis,
         vertical_axis=geometry.vertical_axis,
+        lateral_offset_upper_mm=geometry.lateral_offset_upper_mm,
+        lateral_offset_lower_mm=geometry.lateral_offset_lower_mm,
+        v_upper_mm=geometry.v_upper_mm,
+        v_lower_mm=geometry.v_lower_mm,
         residuals_mm=geometry.residuals_mm,
         vertical_range_mm=(float(low), float(high)),
+        upper_centerline_world=geometry.upper_centerline_world,
+        lower_centerline_world=geometry.lower_centerline_world,
     )
 
 
 # -- sampling ----------------------------------------------------------------
 
 
-def _project_slab(sampled: np.ndarray, config: PanoramaConfig) -> np.ndarray:
+def _hu_band_shape(sampled: np.ndarray) -> np.ndarray:
+    """Piecewise gain on HU so dentin/cortex sit in the mid-range instead of
+    being washed out by enamel/restoration saturation.
+
+    - air / soft tissue (<200 HU) → low (near zero) so the background stays dark
+    - bone (200..1800 HU)         → linear ramp (most of the dynamic range)
+    - very dense (>1800 HU)       → log-compressed so enamel/restorations don't
+                                     blow out and erase cortical bone contrast
+
+    The output is a unitless attenuation surrogate; mean over the slab gives an
+    OPG-like path integral with much stronger bone/dentin separation than the
+    raw `(HU+1000)/1000` ramp.
+    """
+    s = sampled.astype(np.float32, copy=False)
+    low = np.clip((s - (-200.0)) / 400.0, 0.0, 1.0) * 0.05  # soft tissue floor
+    bone = np.clip((s - 200.0) / 1600.0, 0.0, 1.0)           # 0..1 over 200..1800
+    dense_excess = np.maximum(s - 1800.0, 0.0)
+    dense = np.log1p(dense_excess / 1500.0) * 0.4            # compressed tail
+    return low + bone + dense
+
+
+def _project_slab(
+    sampled: np.ndarray, config: PanoramaConfig, slab_weights: np.ndarray | None = None
+) -> np.ndarray:
     mode = config.projection_mode.lower()
     if mode == "xray":
-        # Simulated X-ray: integrate (HU + 1000) along the slab so each voxel
-        # contributes its relative density. Path-integrated attenuation
-        # preserves both bright structures (enamel, cortex) and dark cavities
-        # (pulp, mandibular canal, marrow) — clinical OPG appearance. MIP
-        # discards every voxel except the brightest and erases the cavities.
-        attenuation = np.maximum(sampled + 1000.0, 0.0)
-        return attenuation.mean(axis=1).astype(np.float32, copy=False)
+        # Path-integrated, HU-shaped, cosine-weighted along U so the spline-
+        # centred voxels dominate. The cosine weighting sharpens enamel and
+        # canal walls without becoming pure MIP (which erases the canal lumen).
+        shaped = _hu_band_shape(sampled)
+        if slab_weights is None or slab_weights.shape[0] != shaped.shape[1]:
+            return shaped.mean(axis=1).astype(np.float32, copy=False)
+        w = slab_weights.astype(np.float32).reshape(1, -1, 1)
+        return (shaped * w).sum(axis=1).astype(np.float32, copy=False)
     if mode == "mip":
         return sampled.max(axis=1)
     if mode == "percentile":
@@ -508,6 +676,11 @@ def _project_slab(sampled: np.ndarray, config: PanoramaConfig) -> np.ndarray:
     if mode == "mean":
         return sampled.mean(axis=1)
     raise ValueError(f"Unsupported projection_mode: {config.projection_mode}")
+
+
+def _smoothstep(t: np.ndarray) -> np.ndarray:
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
 
 
 def sample_panorama(
@@ -519,7 +692,7 @@ def sample_panorama(
     inv_affine = np.linalg.inv(affine)
     air_value = float(np.nanpercentile(raw, 0.5))
     u_values = _grid_values(-config.slab_half_width_mm, config.slab_half_width_mm, config.plane_resolution_mm)
-    v_min, v_max = geometry.vertical_range_mm
+    v_min, v_max = geometry.vertical_range_mm  # offsets from centerline V
     v_values = _grid_values(v_min, v_max, config.plane_resolution_mm)
     height = len(v_values)
     slab_width = len(u_values)
@@ -533,18 +706,50 @@ def sample_panorama(
     row_total = np.zeros(height, dtype=np.int64)
 
     v_axis = geometry.vertical_axis
-    centerline_offset = v_axis * (geometry.centerline_world @ v_axis).mean()  # not used; kept for clarity
-    del centerline_offset
+    centerline = geometry.centerline_world
+    width_axis = geometry.width_axis
+
+    # Per-row blend factor expressed in V offsets relative to the unified
+    # centerline. The unified centerline sits at mean tooth V, so:
+    #   t = 0 at V offset = v_upper_mm - v_center  (upper-tooth band)
+    #   t = 1 at V offset = v_lower_mm - v_center  (lower-tooth band)
+    v_center = float(np.mean(centerline @ v_axis))
+    v_upper_rel = float(geometry.v_upper_mm) - v_center
+    v_lower_rel = float(geometry.v_lower_mm) - v_center
+    denom = v_lower_rel - v_upper_rel
+    if abs(denom) < 1e-6:
+        t_row = np.zeros(height, dtype=np.float64)
+    else:
+        t_row = _smoothstep((v_values - v_upper_rel) / denom)
+
+    # Cosine-weighted slab profile for the xray projection — values per U slot.
+    if slab_width > 1:
+        u_norm = u_values / float(config.slab_half_width_mm)
+        slab_weights = np.cos(0.5 * math.pi * np.clip(u_norm, -1.0, 1.0)) ** 2
+    else:
+        slab_weights = np.ones(slab_width, dtype=np.float64)
+    slab_weights = slab_weights.astype(np.float64) / max(float(slab_weights.sum()), 1e-8)
+
+    upper_off = geometry.lateral_offset_upper_mm
+    lower_off = geometry.lateral_offset_lower_mm
 
     for start in range(0, columns, config.chunk_columns):
         end = min(columns, start + config.chunk_columns)
-        centers = geometry.centerline_world[start:end]               # (B, 3)
-        width_axis = geometry.width_axis[start:end]                  # (B, 3)
+        centers = centerline[start:end]               # (B, 3)
+        w_axis = width_axis[start:end]                # (B, 3)
 
-        # (V, U, B, 3): for each (v, u) and each column b, world position.
+        # Per-(V, B) lateral offset along width_axis, blended from upper/lower.
+        u_off = upper_off[start:end]                  # (B,)
+        l_off = lower_off[start:end]                  # (B,)
+        # (V, B)
+        offset_vb = (1.0 - t_row)[:, None] * u_off[None, :] + t_row[:, None] * l_off[None, :]
+
+        # (V, U, B, 3): for each (v, u, column), world sample position.
+        # base = centers + (offset_vb + u) * width_axis + v * v_axis
+        u_total = offset_vb[:, None, :, None] + u_values[None, :, None, None]   # (V, U, B, 1)
         points = (
             centers[None, None, :, :]
-            + u_values[None, :, None, None] * width_axis[None, None, :, :]
+            + u_total * w_axis[None, None, :, :]
             + v_values[:, None, None, None] * v_axis[None, None, None, :]
         )
         flat = points.reshape(-1, 3)
@@ -564,7 +769,7 @@ def sample_panorama(
             cval=air_value,
         ).reshape(height, slab_width, end - start)
 
-        panorama[:, start:end] = _project_slab(sampled, config).astype(np.float32, copy=False)
+        panorama[:, start:end] = _project_slab(sampled, config, slab_weights).astype(np.float32, copy=False)
 
     qc = {
         "height_pixels": int(height),
@@ -572,6 +777,9 @@ def sample_panorama(
         "slab_width_pixels": int(slab_width),
         "v_min_mm": float(v_values[0]),
         "v_max_mm": float(v_values[-1]),
+        "v_upper_rel_mm": float(v_upper_rel),
+        "v_lower_rel_mm": float(v_lower_rel),
+        "v_center_world_mm": float(v_center),
         "u_min_mm": float(u_values[0]),
         "u_max_mm": float(u_values[-1]),
         "air_value": float(air_value),
@@ -625,7 +833,21 @@ def normalize_panorama(panorama: np.ndarray, config: PanoramaConfig) -> tuple[np
         clipped = np.clip(panorama, low, high)
         normalized = ((clipped - low) / (high - low)).astype(np.float32)
     if config.apply_clahe and normalized.size:
-        normalized = exposure.equalize_adapthist(normalized, clip_limit=config.clahe_clip_limit).astype(np.float32)
+        # Default skimage tile (8×8) is too small for a 1200-wide panoramic
+        # and over-equalises local texture. Aim for ~8 tiles vertical and ~32
+        # horizontal — comparable to clinical OPG sharpening grids.
+        h, w = normalized.shape
+        kernel_size = (max(16, h // 8), max(16, w // 32))
+        normalized = exposure.equalize_adapthist(
+            normalized, kernel_size=kernel_size, clip_limit=config.clahe_clip_limit
+        ).astype(np.float32)
+    if config.unsharp_amount > 0.0 and normalized.size:
+        # Post-CLAHE unsharp mask gives the snappy edges of a real OPG without
+        # turning fine cancellous-bone texture into noise.
+        from scipy.ndimage import gaussian_filter
+        blurred = gaussian_filter(normalized, sigma=float(config.unsharp_sigma_px))
+        sharpened = normalized + float(config.unsharp_amount) * (normalized - blurred)
+        normalized = np.clip(sharpened, 0.0, 1.0).astype(np.float32)
     return normalized, {"low": float(low), "high": float(high)}
 
 
@@ -653,20 +875,21 @@ def save_axial_mip_with_spline(
     raw: np.ndarray, affine: np.ndarray, geometry: ArchGeometry, path: Path
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Axial MIP — collapse along the axis that is closest to the down direction.
     down = geometry.vertical_axis
     axis_alignments = np.abs(affine[:3, :3].T @ down)
     axial_axis = int(np.argmax(axis_alignments))
     mip = raw.max(axis=axial_axis)
-    # Project centerline into voxel coordinates and drop the axial axis.
     inv_affine = np.linalg.inv(affine)
-    voxels = _apply_affine(inv_affine, geometry.centerline_world)
+    upper_vox = _apply_affine(inv_affine, geometry.upper_centerline_world)
+    lower_vox = _apply_affine(inv_affine, geometry.lower_centerline_world)
     plane_axes = [a for a in range(3) if a != axial_axis]
 
     fig, ax = plt.subplots(figsize=(8, 8), dpi=140)
     ax.imshow(mip.T if plane_axes == [0, 1] else mip, cmap="gray", origin="lower")
-    ax.plot(voxels[:, plane_axes[0]], voxels[:, plane_axes[1]], color="orange", lw=1.4)
-    ax.set_title("axial MIP with fitted arch spline")
+    ax.plot(upper_vox[:, plane_axes[0]], upper_vox[:, plane_axes[1]], color="orange", lw=1.4, label="upper arch")
+    ax.plot(lower_vox[:, plane_axes[0]], lower_vox[:, plane_axes[1]], color="cyan", lw=1.4, label="lower arch")
+    ax.legend(loc="lower right", fontsize=8, facecolor="black", labelcolor="white")
+    ax.set_title("axial MIP with upper/lower arch splines")
     ax.set_xticks([])
     ax.set_yticks([])
     fig.tight_layout()
@@ -686,11 +909,30 @@ def save_sample_plane_montage(
     v_min, v_max = geometry.vertical_range_mm
     v_values = _grid_values(v_min, v_max, config.plane_resolution_mm)
 
+    v_axis = geometry.vertical_axis
+    v_center = float(np.mean(geometry.centerline_world @ v_axis))
+    v_upper_rel = float(geometry.v_upper_mm) - v_center
+    v_lower_rel = float(geometry.v_lower_mm) - v_center
+    denom = v_lower_rel - v_upper_rel
+    if abs(denom) < 1e-6:
+        t_row = np.zeros(len(v_values), dtype=np.float64)
+    else:
+        t_row = _smoothstep((v_values - v_upper_rel) / denom)
+
     planes = []
     for col in columns:
-        c = geometry.centerline_world[int(col)]
-        u_axis = geometry.width_axis[int(col)]
-        pts = c[None, None, :] + u_values[None, :, None] * u_axis[None, None, :] + v_values[:, None, None] * geometry.vertical_axis[None, None, :]
+        idx = int(col)
+        c = geometry.centerline_world[idx]
+        w = geometry.width_axis[idx]
+        u_off = float(geometry.lateral_offset_upper_mm[idx])
+        l_off = float(geometry.lateral_offset_lower_mm[idx])
+        offset_v = (1.0 - t_row) * u_off + t_row * l_off  # (V,)
+        u_total = offset_v[:, None] + u_values[None, :]   # (V, U)
+        pts = (
+            c[None, None, :]
+            + u_total[:, :, None] * w[None, None, :]
+            + v_values[:, None, None] * v_axis[None, None, :]
+        )
         vox = _apply_affine(inv_affine, pts.reshape(-1, 3))
         sampled = map_coordinates(raw, [vox[:, 0], vox[:, 1], vox[:, 2]], order=1, mode="constant", cval=air_value)
         planes.append(sampled.reshape(len(v_values), len(u_values)).astype(np.float32))
@@ -725,7 +967,7 @@ def reconstruct_case(raw_path: Path, seg_path: Path, output_dir: Path, config: P
     centroids = extract_tooth_centroids(seg, affine, config)
     if len(centroids) < 4:
         raise RuntimeError(f"{case_id}: only {len(centroids)} tooth centroids found — cannot fit a panoramic arch.")
-    down_axis = estimate_down_axis(centroids, affine)
+    down_axis = estimate_down_axis(centroids, affine, seg=seg)
     geometry = fit_unified_arch(centroids, down_axis, config)
     geometry = compute_vertical_range(seg, affine, geometry, tuple(int(v) for v in raw.shape), config)
 
