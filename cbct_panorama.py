@@ -136,6 +136,7 @@ class PanoramaConfig:
     crop_oob_threshold: float = 0.75
     crop_margin_rows: int = 6
     flip_horizontal: bool = True
+    dual_arch_offset: bool = False   # single unified focal trough (OPG-like) when False
     chunk_columns: int = 256
     terminal_gap_outlier_factor: float = 2.4
     terminal_gap_outlier_min_mm: float = 20.0
@@ -279,21 +280,50 @@ def estimate_down_axis(
     affine: np.ndarray,
     seg: np.ndarray | None = None,
 ) -> np.ndarray:
-    # Use the upper-vs-lower tooth centroid difference. Jaw-label centroids
-    # (mandible vs maxilla) sound more robust but in practice the mandible
-    # extends ~50 mm posteriorly via the rami while the maxilla doesn't, so
-    # mean(mandible) − mean(maxilla) is heavily tilted in the AP direction —
-    # tested on P_489 it deviates ~40° from the actual supero-inferior axis
-    # and makes the slab walk diagonally through the head. The tooth centroids
-    # are anatomically near each other on both arches, so their difference
-    # vector is close to the true SI direction.
+    # Supero-inferior axis = normal of the occlusal plane. The tooth centroids
+    # of both arches form a thin, roughly planar slab (arch width ~50 mm, depth
+    # ~40 mm, SI thickness ~10 mm), so the smallest principal axis of that cloud
+    # is the occlusal-plane normal. Using the PCA normal (rather than just
+    # mean(lower) − mean(upper)) *levels* the reformat: teeth land at a
+    # consistent image row and the panorama comes out horizontal instead of
+    # tilted with the patient's head pose. The lower−upper vector only fixes the
+    # sign (down points from maxilla toward mandible) and is the fallback.
     upper = np.array([c.world for c in centroids if c.arch == "upper"], dtype=np.float64)
     lower = np.array([c.world for c in centroids if c.arch == "lower"], dtype=np.float64)
+    all_pts = np.array([c.world for c in centroids], dtype=np.float64)
+    weights = np.array([max(c.voxel_count, 1) for c in centroids], dtype=np.float64)
+
+    # Scanner z is the anatomical prior: CBCT patients are positioned upright, so
+    # true supero-inferior sits within ~15° of it. mean(lower)−mean(upper) is a
+    # weak sign hint but is itself tilted 20–47° by molar asymmetry, so it is NOT
+    # used as the axis — only to orient the sign toward "inferior".
+    z = _normalize(affine[:3, 2])
+    sign_ref = None
     if len(upper) and len(lower):
-        down = lower.mean(axis=0) - upper.mean(axis=0)
-        if np.linalg.norm(down) > 1e-6:
-            return _normalize(down)
-    return _normalize(affine[:3, 2])
+        sign_ref = lower.mean(axis=0) - upper.mean(axis=0)
+
+    def _orient(v: np.ndarray) -> np.ndarray:
+        if sign_ref is not None and np.dot(v, sign_ref) < 0:
+            return -v
+        if sign_ref is None and np.dot(v, z) < 0:
+            return -v
+        return v
+
+    if len(all_pts) >= 4:
+        mean = np.average(all_pts, axis=0, weights=weights)
+        centered = all_pts - mean
+        cov = (centered * weights[:, None]).T @ centered / weights.sum()
+        _evals, evecs = np.linalg.eigh(cov)
+        normal = _normalize(evecs[:, 0])  # smallest eigenvalue → occlusal normal
+        # Accept the PCA normal only if it agrees with the scanner axis (guards
+        # against a degenerate cloud picking an in-plane direction). This levels
+        # the reformat: the occlusal plane becomes horizontal.
+        if abs(float(np.dot(normal, z))) > math.cos(math.radians(35.0)):
+            return _orient(normal)
+
+    if sign_ref is not None and np.linalg.norm(sign_ref) > 1e-6:
+        return _normalize(sign_ref)
+    return _orient(z)
 
 
 def _project_to_axial(points: np.ndarray, down_axis: np.ndarray) -> np.ndarray:
@@ -359,12 +389,17 @@ def _anchors_by_arch_position(
     axial plane so the spline lives at the mean occlusal height set by
     ``fit_unified_arch``.
     """
-    by_position: dict[int, list[tuple[np.ndarray, float]]] = {}
+    # Per slot, split entries by dentition. In mixed dentition a deciduous tooth
+    # and its permanent successor (a bud deep in bone) share a slot but sit at
+    # very different places — averaging them displaces the anchor. So prefer
+    # permanent teeth where present and only fall back to deciduous otherwise.
+    by_position: dict[int, dict[str, list[tuple[np.ndarray, float]]]] = {}
     for c in centroids:
         pos = LABEL_TO_ARCH_POSITION.get(int(c.label))
         if pos is None:
             continue
-        by_position.setdefault(pos, []).append(
+        kind = "permanent" if 11 <= int(c.label) <= 48 else "deciduous"
+        by_position.setdefault(pos, {"permanent": [], "deciduous": []})[kind].append(
             (np.asarray(c.world, dtype=np.float64), float(max(c.voxel_count, 1)))
         )
     if not by_position:
@@ -372,7 +407,8 @@ def _anchors_by_arch_position(
     positions = np.array(sorted(by_position.keys()), dtype=np.int64)
     anchors = []
     for pos in positions:
-        entries = by_position[int(pos)]
+        groups = by_position[int(pos)]
+        entries = groups["permanent"] if groups["permanent"] else groups["deciduous"]
         coords = np.stack([e[0] for e in entries], axis=0)
         weights = np.array([e[1] for e in entries], dtype=np.float64)
         anchors.append((coords * weights[:, None]).sum(axis=0) / weights.sum())
@@ -453,7 +489,25 @@ def _fit_arch_base(
         return None
 
     pts_2d = np.column_stack([anchors_world @ e1, anchors_world @ e2])
-    pts_2d, replaced_positions = _patch_outlier_anchors(positions, pts_2d)
+    # Order anchors by sweep angle around the arch centre (robust to mixed
+    # dentition, where FDI-slot order can zig-zag). Rotate the sequence so it
+    # starts just after the largest angular gap — that gap is the open, poster-
+    # ior side of the U, so the walk runs cleanly molar → incisors → molar.
+    if len(pts_2d) >= 4:
+        centre = pts_2d.mean(axis=0)
+        ang = np.arctan2(pts_2d[:, 1] - centre[1], pts_2d[:, 0] - centre[0])
+        order = np.argsort(ang)
+        ang_sorted = ang[order]
+        gaps = np.diff(np.concatenate([ang_sorted, ang_sorted[:1] + 2 * np.pi]))
+        start = int(np.argmax(gaps)) + 1
+        order = np.roll(order, -start)
+        pts_2d = pts_2d[order]
+        positions = positions[order]
+    # Patch outliers against a monotonic arch-order rank (post-sort FDI slots are
+    # no longer monotonic, and UnivariateSpline needs strictly increasing x).
+    rank = np.arange(len(pts_2d), dtype=np.int64)
+    pts_2d, _replaced_rank = _patch_outlier_anchors(rank, pts_2d)
+    replaced_positions = [int(positions[r]) for r in _replaced_rank if r < len(positions)]
 
     kept_indices = [0]
     for i in range(1, len(pts_2d)):
@@ -571,6 +625,13 @@ def fit_unified_arch(
     def lateral_offsets(base: _BaseArchFit | None, fallback_v: float) -> tuple[np.ndarray, float]:
         if base is None:
             return np.zeros(len(centerline), dtype=np.float64), fallback_v
+        if not config.dual_arch_offset:
+            # Single unified focal trough (the reference OPG look). We still
+            # report the per-arch mean V for the row blend, but the slab follows
+            # one curve — no per-arch lateral offset, which is fragile when a
+            # per-arch spline misbehaves on mixed dentition.
+            _, _, _, mean_v, _ = _finalize_arch(base, down_axis, n_ext, unified_base.mean_step_mm)
+            return np.zeros(len(centerline), dtype=np.float64), float(mean_v)
         # Re-extend the per-arch base at the same shared step so its sampling
         # density matches the unified extension footprint.
         arch_centerline, _, _, mean_v, _ = _finalize_arch(base, down_axis, n_ext, unified_base.mean_step_mm)
