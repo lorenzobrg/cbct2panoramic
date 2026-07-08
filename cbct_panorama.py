@@ -17,24 +17,34 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
 from PIL import Image
 from scipy.interpolate import splev, splprep
 from scipy.ndimage import map_coordinates
 from scipy.spatial import cKDTree
-from skimage import exposure
 
 
-UPPER_TOOTH_LABELS = tuple(range(11, 19)) + tuple(range(21, 29))
-LOWER_TOOTH_LABELS = tuple(range(31, 39)) + tuple(range(41, 49))
-UPPER_PULP_LABELS = tuple(label + 100 for label in UPPER_TOOTH_LABELS)
-LOWER_PULP_LABELS = tuple(label + 100 for label in LOWER_TOOTH_LABELS)
+def _plt():
+    """Lazily import matplotlib (Agg) — only the --debug plots need it."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt
+
+
+UPPER_PERMANENT_LABELS = tuple(range(11, 19)) + tuple(range(21, 29))
+LOWER_PERMANENT_LABELS = tuple(range(31, 39)) + tuple(range(41, 49))
+# Deciduous (primary) FDI: upper-right 51-55, upper-left 61-65,
+# lower-left 71-75, lower-right 81-85. Including these lets the arch fit work on
+# mixed / primary dentition cases (e.g. bundled cases 44 and 60) instead of
+# collapsing onto whatever few permanent teeth are present.
+UPPER_DECIDUOUS_LABELS = tuple(range(51, 56)) + tuple(range(61, 66))
+LOWER_DECIDUOUS_LABELS = tuple(range(71, 76)) + tuple(range(81, 86))
+UPPER_TOOTH_LABELS = UPPER_PERMANENT_LABELS + UPPER_DECIDUOUS_LABELS
+LOWER_TOOTH_LABELS = LOWER_PERMANENT_LABELS + LOWER_DECIDUOUS_LABELS
+UPPER_PULP_LABELS = tuple(label + 100 for label in UPPER_PERMANENT_LABELS)
+LOWER_PULP_LABELS = tuple(label + 100 for label in LOWER_PERMANENT_LABELS)
 UPPER_JAW_LABELS = (2,)
 LOWER_JAW_LABELS = (1,)
 LOWER_CANAL_LABELS = (3, 4, 103, 104, 105)
@@ -51,6 +61,18 @@ ARCH_POSITION_ORDER: tuple[tuple[int, int], ...] = (
 LABEL_TO_ARCH_POSITION: dict[int, int] = {
     label: index for index, pair in enumerate(ARCH_POSITION_ORDER) for label in pair
 }
+# Map each deciduous tooth onto the nearest permanent arch slot so it anchors
+# the curve at the right place along the arch. A deciduous tooth and a permanent
+# tooth sharing a slot are voxel-weighted-averaged (mixed dentition).
+#   central(x1)->central slot, lateral(x2)->lateral, canine(x3)->canine,
+#   1st molar(x4)->1st premolar slot, 2nd molar(x5)->2nd premolar slot.
+_DECIDUOUS_TO_ARCH_POSITION: dict[int, int] = {
+    51: 7, 52: 6, 53: 5, 54: 4, 55: 3,   # upper right
+    61: 8, 62: 9, 63: 10, 64: 11, 65: 12,  # upper left
+    71: 8, 72: 9, 73: 10, 74: 11, 75: 12,  # lower left
+    81: 7, 82: 6, 83: 5, 84: 4, 85: 3,   # lower right
+}
+LABEL_TO_ARCH_POSITION.update(_DECIDUOUS_TO_ARCH_POSITION)
 EXTENT_LABELS = (
     UPPER_JAW_LABELS
     + LOWER_JAW_LABELS
@@ -68,25 +90,59 @@ class PanoramaConfig:
     spline_resolution: int = 1200
     spline_smoothing: float | None = None   # None → auto from arc length
     plane_resolution_mm: float = 0.2
-    slab_half_width_mm: float = 7.0
-    vertical_margin_mm: float = 6.0
-    endpoint_extension_mm: float = 18.0
+    slab_half_width_mm: float = 9.0
+    vertical_margin_mm: float = 8.0
+    endpoint_extension_mm: float = 30.0     # sweep back to the condyles/TMJ
+
+    # -- compute backend --
+    device: str = "auto"                    # auto | cuda | cpu
+
+    # -- HU → linear attenuation (mu) transfer --
+    # Piecewise, continuous, monotonic. Air/soft tissue keep a small non-zero
+    # floor so sinuses/airway read as grey (not black); the bone band is linear
+    # to preserve trabecular texture; the dense tail (enamel/metal) is
+    # log-compressed so it cannot saturate and erase cortical/bone contrast.
+    mu_air: float = 0.002
+    hu_soft_knee: float = 200.0             # soft-tissue → bone boundary
+    mu_soft_knee: float = 0.020            # mu at hu_soft_knee
+    hu_dense_knee: float = 2500.0          # bone → dense (enamel/metal) boundary
+    mu_bone_hi: float = 0.85               # mu at hu_dense_knee
+    dense_scale_hu: float = 1500.0         # log1p scale of the dense tail
+    dense_gain: float = 0.15               # log1p gain of the dense tail
+
+    # -- along-U path integral --
+    # Accumulated attenuation A = sum_u w(u)·mu (film-positive: dense = bright).
+    # w(u) = (1-beta) + beta·cos^2 : beta=1 → sharp/shallow, beta=0 → deep/flat.
+    projection_beta: float = 0.55
+
+    # -- tone mapping --
+    intensity_clip_low_pct: float = 1.0
+    intensity_clip_high_pct: float = 99.5
+    tone_gamma: float = 0.75               # <1 lifts shadows/mid (main lever)
+    local_contrast_sigma_px: float = 50.0
+    local_contrast_target_std: float = 0.18
+    local_contrast_gain_min: float = 0.5
+    local_contrast_gain_max: float = 2.5
+    apply_local_contrast: bool = True
+    unsharp_amount: float = 0.5
+    unsharp_sigma_px: float = 3.5
+
+    # -- legacy CPU projection knobs (kept for the parity test only) --
     projection_mode: str = "xray"           # xray | mip | percentile | mean
     projection_percentile: float = 96.0
-    intensity_clip_low_pct: float = 0.5
-    intensity_clip_high_pct: float = 99.7
-    apply_clahe: bool = True
+    apply_clahe: bool = False
     clahe_clip_limit: float = 0.01
-    unsharp_amount: float = 0.45
-    unsharp_sigma_px: float = 4.0
+
     crop_oob_threshold: float = 0.75
     crop_margin_rows: int = 6
     flip_horizontal: bool = True
-    chunk_columns: int = 32
+    chunk_columns: int = 256
     terminal_gap_outlier_factor: float = 2.4
     terminal_gap_outlier_min_mm: float = 20.0
     save_debug: bool = False
     max_extent_samples: int = 300_000
+    # Overlay: tint segmentation structures on the grayscale base.
+    overlay: bool = False
 
 
 @dataclass(frozen=True)
@@ -683,6 +739,264 @@ def _smoothstep(t: np.ndarray) -> np.ndarray:
     return t * t * (3.0 - 2.0 * t)
 
 
+# -- GPU backend (torch) -----------------------------------------------------
+#
+# Volume sampling uses torch.nn.functional.grid_sample (trilinear) — a standard
+# op, no custom kernels — so the exact same code runs on AMD (ROCm) and NVIDIA
+# (CUDA) GPUs and on CPU. The projection is an accumulated-attenuation path
+# integral (film-positive: dense = bright) and the tone map is fully on-device.
+
+
+def select_device(name: str = "auto") -> "Any":
+    import torch
+
+    name = (name or "auto").lower()
+    if name == "cpu":
+        return torch.device("cpu")
+    if name in ("cuda", "gpu"):
+        if not torch.cuda.is_available():
+            raise RuntimeError("device='cuda' requested but no GPU is visible to torch.")
+        return torch.device("cuda")
+    # auto
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _row_blend(geometry: ArchGeometry, v_values: np.ndarray) -> np.ndarray:
+    """Per-row upper→lower blend factor t (0 at upper band, 1 at lower band),
+    matching the CPU sampler's ``_smoothstep`` behaviour."""
+    v_axis = geometry.vertical_axis
+    v_center = float(np.mean(geometry.centerline_world @ v_axis))
+    v_upper_rel = float(geometry.v_upper_mm) - v_center
+    v_lower_rel = float(geometry.v_lower_mm) - v_center
+    denom = v_lower_rel - v_upper_rel
+    if abs(denom) < 1e-6:
+        return np.zeros(len(v_values), dtype=np.float64)
+    return _smoothstep((v_values - v_upper_rel) / denom)
+
+
+def _apply_affine_torch(pts: "Any", R: "Any", t: "Any") -> "Any":
+    """world → voxel index = R @ pts + t, computed elementwise.
+
+    NOTE: a batched 4-D matmul ``pts @ R.T`` is silently WRONG on some ROCm
+    builds (rocBLAS mishandles the (…,3)@(3,3) contraction — verified off by
+    O(100) voxels on gfx1201). A 2-D matmul and this elementwise form are both
+    correct, so we do the transform componentwise with plain multiply/add.
+    """
+    import torch
+
+    x = pts[..., 0] * R[0, 0] + pts[..., 1] * R[0, 1] + pts[..., 2] * R[0, 2] + t[0]
+    y = pts[..., 0] * R[1, 0] + pts[..., 1] * R[1, 1] + pts[..., 2] * R[1, 2] + t[1]
+    z = pts[..., 0] * R[2, 0] + pts[..., 1] * R[2, 1] + pts[..., 2] * R[2, 2] + t[2]
+    return torch.stack((x, y, z), dim=-1)
+
+
+def _hu_to_mu_torch(h: "Any", config: PanoramaConfig) -> "Any":
+    """HU → linear-attenuation surrogate mu(h), piecewise + continuous + monotone.
+
+    region 1 (h < hu_soft_knee):  mu_air .. mu_soft_knee, linear in (h+1000)
+    region 2 (soft..dense knee):  linear ramp mu_soft_knee .. mu_bone_hi
+    region 3 (h > hu_dense_knee):  mu_bone_hi + dense_gain·log1p((h-knee)/scale)
+    """
+    import torch
+
+    soft_k = config.hu_soft_knee
+    mu_soft = config.mu_soft_knee
+    dense_k = config.hu_dense_knee
+    mu_hi = config.mu_bone_hi
+
+    # region 1: air/soft-tissue floor. At h=-1000 → mu_air; at soft_k → mu_soft.
+    t1 = torch.clamp((h + 1000.0) / (soft_k + 1000.0), 0.0, 1.0)
+    r1 = config.mu_air + (mu_soft - config.mu_air) * t1
+    # region 2: bone linear ramp.
+    t2 = torch.clamp((h - soft_k) / (dense_k - soft_k), 0.0, 1.0)
+    r2 = mu_soft + (mu_hi - mu_soft) * t2
+    # region 3: dense (enamel/metal) log-compressed tail.
+    excess = torch.clamp(h - dense_k, min=0.0)
+    r3 = mu_hi + config.dense_gain * torch.log1p(excess / config.dense_scale_hu)
+
+    mu = torch.where(h < soft_k, r1, r2)
+    mu = torch.where(h > dense_k, r3, mu)
+    return mu
+
+
+def sample_project_torch(
+    raw: np.ndarray,
+    affine: np.ndarray,
+    geometry: ArchGeometry,
+    config: PanoramaConfig,
+    device: "Any | None" = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Sample the curved slab and project it to an accumulated-attenuation
+    panorama on the selected torch device. Returns (A[V,C] float32, qc)."""
+    import torch
+    import torch.nn.functional as F
+
+    if device is None:
+        device = select_device(config.device)
+
+    air_value = float(np.nanpercentile(raw, 0.5))
+    u_values = _grid_values(-config.slab_half_width_mm, config.slab_half_width_mm, config.plane_resolution_mm)
+    v_min, v_max = geometry.vertical_range_mm
+    v_values = _grid_values(v_min, v_max, config.plane_resolution_mm)
+    V, U, C = len(v_values), len(u_values), len(geometry.centerline_world)
+
+    inv_affine = np.linalg.inv(affine)
+    inv_R = torch.as_tensor(inv_affine[:3, :3], dtype=torch.float32, device=device)
+    inv_t = torch.as_tensor(inv_affine[:3, 3], dtype=torch.float32, device=device)
+
+    # Geometry → device (float32).
+    centerline = torch.as_tensor(geometry.centerline_world, dtype=torch.float32, device=device)   # (C,3)
+    width_axis = torch.as_tensor(geometry.width_axis, dtype=torch.float32, device=device)          # (C,3)
+    v_axis = torch.as_tensor(geometry.vertical_axis, dtype=torch.float32, device=device)           # (3,)
+    u_t = torch.as_tensor(u_values, dtype=torch.float32, device=device)                            # (U,)
+    v_t = torch.as_tensor(v_values, dtype=torch.float32, device=device)                            # (V,)
+
+    t_row = torch.as_tensor(_row_blend(geometry, v_values), dtype=torch.float32, device=device)    # (V,)
+    upper_off = torch.as_tensor(geometry.lateral_offset_upper_mm, dtype=torch.float32, device=device)  # (C,)
+    lower_off = torch.as_tensor(geometry.lateral_offset_lower_mm, dtype=torch.float32, device=device)  # (C,)
+    offset_vc = (1.0 - t_row)[:, None] * upper_off[None, :] + t_row[:, None] * lower_off[None, :]   # (V,C)
+
+    # Raised-cosine slab weight w(u), normalized (weighted mean over U).
+    if U > 1:
+        u_norm = torch.clamp(u_t / float(config.slab_half_width_mm), -1.0, 1.0)
+        w = (1.0 - config.projection_beta) + config.projection_beta * torch.cos(0.5 * math.pi * u_norm) ** 2
+    else:
+        w = torch.ones(U, dtype=torch.float32, device=device)
+    w = w / torch.clamp(w.sum(), min=1e-8)                                                         # (U,)
+
+    # Volume as (1,1,I,J,K), shifted so out-of-bounds (zeros pad) reads as air.
+    vol = torch.as_tensor(np.ascontiguousarray(raw, dtype=np.float32), device=device)
+    vol = (vol - air_value)[None, None]                                                            # (1,1,I,J,K)
+    I, J, K = raw.shape
+    size = torch.as_tensor([I - 1, J - 1, K - 1], dtype=torch.float32, device=device)
+
+    A = torch.empty((V, C), dtype=torch.float32, device=device)
+    row_oob = np.zeros(V, dtype=np.int64)
+    row_total = np.zeros(V, dtype=np.int64)
+    oob_total = 0
+    total = 0
+
+    chunk = max(1, int(config.chunk_columns))
+    for start in range(0, C, chunk):
+        end = min(C, start + chunk)
+        cc = end - start
+        centers = centerline[start:end]                # (cc,3)
+        w_axis = width_axis[start:end]                 # (cc,3)
+        u_total = offset_vc[:, None, start:end] + u_t[None, :, None]     # (V,U,cc)
+        # world point (V,U,cc,3)
+        pts = (
+            centers[None, None, :, :]
+            + u_total[..., None] * w_axis[None, None, :, :]
+            + v_t[:, None, None, None] * v_axis[None, None, None, :]
+        )
+        voxel = _apply_affine_torch(pts, inv_R, inv_t)                  # (V,U,cc,3) continuous voxel index
+
+        # OOB bookkeeping (for crop_oob_rows parity).
+        oob = ((voxel < 0.0) | (voxel > size)).any(dim=-1)   # (V,U,cc)
+        row_oob += oob.sum(dim=(1, 2)).to("cpu").numpy()
+        row_total += U * cc
+        oob_total += int(oob.sum().item())
+        total += V * U * cc
+
+        # normalized coords, align_corners=True; grid last dim = (x=K, y=J, z=I),
+        # reversed vs volume axes (I,J,K).
+        norm = 2.0 * voxel / size - 1.0                # (V,U,cc,3) for axes (I,J,K)
+        grid = torch.stack((norm[..., 2], norm[..., 1], norm[..., 0]), dim=-1)  # (V,U,cc,3)
+        grid = grid[None]                              # (1,V,U,cc,3)
+
+        sampled = F.grid_sample(vol, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+        sampled = sampled[0, 0] + air_value            # (V,U,cc) HU
+        mu = _hu_to_mu_torch(sampled, config)          # (V,U,cc)
+        A[:, start:end] = torch.einsum("vuc,u->vc", mu, w)
+
+    A_cpu = A.to("cpu").numpy().astype(np.float32)
+    qc = {
+        "backend": "torch",
+        "device": str(device),
+        "height_pixels": int(V),
+        "columns": int(C),
+        "slab_width_pixels": int(U),
+        "v_min_mm": float(v_values[0]),
+        "v_max_mm": float(v_values[-1]),
+        "u_min_mm": float(u_values[0]),
+        "u_max_mm": float(u_values[-1]),
+        "air_value": air_value,
+        "projection_beta": float(config.projection_beta),
+        "out_of_bounds_fraction": float(oob_total / max(total, 1)),
+        "row_out_of_bounds_fraction": (row_oob / np.maximum(row_total, 1)).astype(float).tolist(),
+    }
+    return A_cpu, qc
+
+
+def _gaussian_blur_torch(img: "Any", sigma: float) -> "Any":
+    """Separable Gaussian blur of a 2-D image tensor via conv2d (reflect pad)."""
+    import torch
+    import torch.nn.functional as F
+
+    if sigma <= 0:
+        return img
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    x = torch.arange(-radius, radius + 1, dtype=img.dtype, device=img.device)
+    k = torch.exp(-0.5 * (x / sigma) ** 2)
+    k = k / k.sum()
+    t = img[None, None]                                 # (1,1,H,W)
+    kh = k.view(1, 1, -1, 1)
+    kv = k.view(1, 1, 1, -1)
+    t = F.pad(t, (0, 0, radius, radius), mode="reflect")
+    t = F.conv2d(t, kh)
+    t = F.pad(t, (radius, radius, 0, 0), mode="reflect")
+    t = F.conv2d(t, kv)
+    return t[0, 0]
+
+
+def tone_map_torch(A: np.ndarray, config: PanoramaConfig, device: "Any | None" = None) -> tuple[np.ndarray, dict[str, Any]]:
+    """Accumulated-attenuation image → display [0,1]: percentile-normalize →
+    gamma shadow-lift → local-contrast normalization → unsharp. All on device."""
+    import torch
+
+    if device is None:
+        device = select_device(config.device)
+    t = torch.as_tensor(np.ascontiguousarray(A, dtype=np.float32), device=device)
+    finite = torch.isfinite(t)
+    if not bool(finite.any()):
+        return np.zeros_like(A, dtype=np.float32), {"low": 0.0, "high": 1.0}
+    t = torch.where(finite, t, torch.zeros_like(t))
+
+    vals = t[finite]
+    lo = torch.quantile(vals, config.intensity_clip_low_pct / 100.0)
+    hi = torch.quantile(vals, config.intensity_clip_high_pct / 100.0)
+    if not bool(torch.isfinite(hi)) or float(hi) <= float(lo):
+        lo, hi = vals.min(), vals.max()
+    if float(hi) <= float(lo):
+        return np.zeros_like(A, dtype=np.float32), {"low": float(lo), "high": float(hi)}
+    t = torch.clamp((t - lo) / (hi - lo), 0.0, 1.0)
+
+    # Gamma shadow-lift.
+    if config.tone_gamma and config.tone_gamma > 0:
+        t = t.clamp(0.0, 1.0) ** float(config.tone_gamma)
+
+    # Local mean/variance contrast normalization (torch-native CLAHE substitute).
+    if config.apply_local_contrast:
+        sigma = float(config.local_contrast_sigma_px)
+        m = _gaussian_blur_torch(t, sigma)
+        v = torch.clamp(_gaussian_blur_torch(t * t, sigma) - m * m, min=0.0)
+        s = torch.sqrt(v + 1e-6)
+        gain = torch.clamp(
+            config.local_contrast_target_std / (s + 1e-6),
+            config.local_contrast_gain_min,
+            config.local_contrast_gain_max,
+        )
+        t = torch.clamp(m + (t - m) * gain, 0.0, 1.0)
+
+    # Unsharp mask.
+    if config.unsharp_amount and config.unsharp_amount > 0:
+        blur = _gaussian_blur_torch(t, float(config.unsharp_sigma_px))
+        t = torch.clamp(t + float(config.unsharp_amount) * (t - blur), 0.0, 1.0)
+
+    out = t.to("cpu").numpy().astype(np.float32)
+    return out, {"low": float(lo), "high": float(hi)}
+
+
 def sample_panorama(
     raw: np.ndarray,
     affine: np.ndarray,
@@ -836,6 +1150,7 @@ def normalize_panorama(panorama: np.ndarray, config: PanoramaConfig) -> tuple[np
         # Default skimage tile (8×8) is too small for a 1200-wide panoramic
         # and over-equalises local texture. Aim for ~8 tiles vertical and ~32
         # horizontal — comparable to clinical OPG sharpening grids.
+        from skimage import exposure
         h, w = normalized.shape
         kernel_size = (max(16, h // 8), max(16, w // 32))
         normalized = exposure.equalize_adapthist(
@@ -852,6 +1167,110 @@ def normalize_panorama(panorama: np.ndarray, config: PanoramaConfig) -> tuple[np
 
 
 # -- output ------------------------------------------------------------------
+
+
+OVERLAY_CANAL_LABELS = (3, 4, 103, 104, 105)
+
+
+def project_segmentation_torch(
+    seg: np.ndarray,
+    affine: np.ndarray,
+    geometry: ArchGeometry,
+    config: PanoramaConfig,
+    device: "Any | None" = None,
+) -> dict[str, np.ndarray]:
+    """Project label groups through the same curved trough as the grayscale
+    image (nearest-neighbour along U, presence = any voxel in the slab). Returns
+    (V,C) float masks in [0,1] registered to the un-cropped grayscale panorama."""
+    import torch
+    import torch.nn.functional as F
+
+    if device is None:
+        device = select_device(config.device)
+
+    u_values = _grid_values(-config.slab_half_width_mm, config.slab_half_width_mm, config.plane_resolution_mm)
+    v_min, v_max = geometry.vertical_range_mm
+    v_values = _grid_values(v_min, v_max, config.plane_resolution_mm)
+    V, U, C = len(v_values), len(u_values), len(geometry.centerline_world)
+
+    inv_affine = np.linalg.inv(affine)
+    inv_R = torch.as_tensor(inv_affine[:3, :3], dtype=torch.float32, device=device)
+    inv_t = torch.as_tensor(inv_affine[:3, 3], dtype=torch.float32, device=device)
+    centerline = torch.as_tensor(geometry.centerline_world, dtype=torch.float32, device=device)
+    width_axis = torch.as_tensor(geometry.width_axis, dtype=torch.float32, device=device)
+    v_axis = torch.as_tensor(geometry.vertical_axis, dtype=torch.float32, device=device)
+    u_t = torch.as_tensor(u_values, dtype=torch.float32, device=device)
+    v_t = torch.as_tensor(v_values, dtype=torch.float32, device=device)
+    t_row = torch.as_tensor(_row_blend(geometry, v_values), dtype=torch.float32, device=device)
+    upper_off = torch.as_tensor(geometry.lateral_offset_upper_mm, dtype=torch.float32, device=device)
+    lower_off = torch.as_tensor(geometry.lateral_offset_lower_mm, dtype=torch.float32, device=device)
+    offset_vc = (1.0 - t_row)[:, None] * upper_off[None, :] + t_row[:, None] * lower_off[None, :]
+
+    vol = torch.as_tensor(np.ascontiguousarray(seg, dtype=np.float32), device=device)[None, None]
+    I, J, K = seg.shape
+    size = torch.as_tensor([I - 1, J - 1, K - 1], dtype=torch.float32, device=device)
+
+    canal_set = torch.as_tensor(OVERLAY_CANAL_LABELS, dtype=torch.float32, device=device)
+    tooth_set = torch.as_tensor(ALL_TOOTH_LABELS, dtype=torch.float32, device=device)
+    canal = torch.zeros((V, C), dtype=torch.float32, device=device)
+    teeth = torch.zeros((V, C), dtype=torch.float32, device=device)
+
+    chunk = max(1, int(config.chunk_columns))
+    for start in range(0, C, chunk):
+        end = min(C, start + chunk)
+        centers = centerline[start:end]
+        w_axis = width_axis[start:end]
+        u_total = offset_vc[:, None, start:end] + u_t[None, :, None]
+        pts = (
+            centers[None, None, :, :]
+            + u_total[..., None] * w_axis[None, None, :, :]
+            + v_t[:, None, None, None] * v_axis[None, None, None, :]
+        )
+        voxel = _apply_affine_torch(pts, inv_R, inv_t)
+        norm = 2.0 * voxel / size - 1.0
+        grid = torch.stack((norm[..., 2], norm[..., 1], norm[..., 0]), dim=-1)[None]
+        lab = F.grid_sample(vol, grid, mode="nearest", padding_mode="zeros", align_corners=True)[0, 0]
+        lab_r = torch.round(lab)
+        is_canal = (lab_r[..., None] == canal_set).any(dim=-1)   # (V,U,cc)
+        is_tooth = (lab_r[..., None] == tooth_set).any(dim=-1)
+        canal[:, start:end] = is_canal.float().amax(dim=1)
+        teeth[:, start:end] = is_tooth.float().amax(dim=1)
+
+    return {"canal": canal.to("cpu").numpy(), "teeth": teeth.to("cpu").numpy()}
+
+
+def _binary_edge(mask: np.ndarray) -> np.ndarray:
+    """1-px outline of a binary mask (presence minus its 1-neighbour erosion)."""
+    m = mask > 0.5
+    er = m.copy()
+    er[1:, :] &= m[:-1, :]; er[:-1, :] &= m[1:, :]
+    er[:, 1:] &= m[:, :-1]; er[:, :-1] &= m[:, 1:]
+    return (m & ~er).astype(np.float32)
+
+
+def compose_overlay(base01: np.ndarray, masks: dict[str, np.ndarray]) -> np.ndarray:
+    """Grayscale base (H,W)∈[0,1] → RGB with canals tinted red (filled, α) and
+    tooth outlines in cyan. Masks are cropped/flipped to match ``base01``."""
+    h, w = base01.shape
+    rgb = np.repeat(base01[:, :, None], 3, axis=2).astype(np.float32)
+    canal = masks.get("canal")
+    teeth = masks.get("teeth")
+    if teeth is not None and teeth.shape == base01.shape:
+        edge = _binary_edge(teeth)
+        cyan = np.array([0.15, 0.9, 0.9], dtype=np.float32)
+        a = (edge * 0.6)[:, :, None]
+        rgb = rgb * (1 - a) + cyan[None, None, :] * a
+    if canal is not None and canal.shape == base01.shape:
+        red = np.array([1.0, 0.15, 0.1], dtype=np.float32)
+        a = (np.clip(canal, 0, 1) * 0.45)[:, :, None]
+        rgb = rgb * (1 - a) + red[None, None, :] * a
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def save_png8_rgb(rgb: np.ndarray, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out = np.rint(np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+    Image.fromarray(out, mode="RGB").save(path)
 
 
 def save_png16(image01: np.ndarray, path: Path) -> None:
@@ -884,6 +1303,7 @@ def save_axial_mip_with_spline(
     lower_vox = _apply_affine(inv_affine, geometry.lower_centerline_world)
     plane_axes = [a for a in range(3) if a != axial_axis]
 
+    plt = _plt()
     fig, ax = plt.subplots(figsize=(8, 8), dpi=140)
     ax.imshow(mip.T if plane_axes == [0, 1] else mip, cmap="gray", origin="lower")
     ax.plot(upper_vox[:, plane_axes[0]], upper_vox[:, plane_axes[1]], color="orange", lw=1.4, label="upper arch")
@@ -942,6 +1362,7 @@ def save_sample_plane_montage(
     if high <= low:
         high = low + 1.0
 
+    plt = _plt()
     fig, axes = plt.subplots(1, len(planes), figsize=(2.6 * len(planes), 5.0), dpi=140)
     if len(planes) == 1:
         axes = [axes]
@@ -971,17 +1392,42 @@ def reconstruct_case(raw_path: Path, seg_path: Path, output_dir: Path, config: P
     geometry = fit_unified_arch(centroids, down_axis, config)
     geometry = compute_vertical_range(seg, affine, geometry, tuple(int(v) for v in raw.shape), config)
 
-    panorama, sampling_qc = sample_panorama(raw, affine, geometry, config)
+    import time
+
+    device = select_device(config.device)
+    t0 = time.time()
+    panorama, sampling_qc = sample_project_torch(raw, affine, geometry, config, device)
     panorama, sampling_qc = crop_oob_rows(panorama, sampling_qc, config)
-    normalized, intensity_qc = normalize_panorama(panorama, config)
+    top = int(sampling_qc.get("cropped_top_rows", 0))
+    bottom = int(sampling_qc.get("cropped_bottom_rows", 0))
+    normalized, intensity_qc = tone_map_torch(panorama, config, device)
+    sampling_qc["reconstruct_seconds"] = round(time.time() - t0, 3)
+
+    overlay_masks: dict[str, np.ndarray] | None = None
+    if config.overlay:
+        overlay_masks = project_segmentation_torch(seg, affine, geometry, config, device)
+        # Match the grayscale crop.
+        v_full = normalized.shape[0] + top + bottom
+        for key, m in overlay_masks.items():
+            if m.shape[0] == v_full:
+                overlay_masks[key] = m[top: v_full - bottom] if bottom else m[top:]
+
     if config.flip_horizontal:
         normalized = normalized[:, ::-1]
-        panorama = panorama[:, ::-1]
+        if overlay_masks is not None:
+            overlay_masks = {k: m[:, ::-1] for k, m in overlay_masks.items()}
 
     main_path = output_dir / f"{case_id}_panoramic.png"
     preview_path = output_dir / f"{case_id}_panoramic_preview.png"
     save_png16(normalized, main_path)
     save_png8(normalized, preview_path)
+
+    overlay_path_str: dict[str, str] = {}
+    if overlay_masks is not None:
+        overlay_rgb = compose_overlay(normalized, overlay_masks)
+        overlay_path = output_dir / f"{case_id}_panoramic_overlay.png"
+        save_png8_rgb(overlay_rgb, overlay_path)
+        overlay_path_str = {"panoramic_overlay_png": str(overlay_path)}
 
     debug_paths: dict[str, str] = {}
     if config.save_debug:
@@ -1008,6 +1454,7 @@ def reconstruct_case(raw_path: Path, seg_path: Path, output_dir: Path, config: P
         "intensity_qc": intensity_qc,
         "panoramic_png": str(main_path),
         "panoramic_preview_png": str(preview_path),
+        **overlay_path_str,
         **debug_paths,
     }
     with (output_dir / f"{case_id}_qc.json").open("w", encoding="utf-8") as f:
@@ -1020,43 +1467,74 @@ def reconstruct_case(raw_path: Path, seg_path: Path, output_dir: Path, config: P
 
 def _config_from_args(args: argparse.Namespace) -> PanoramaConfig:
     return PanoramaConfig(
+        device=args.device,
         spline_resolution=args.spline_resolution,
         spline_smoothing=args.spline_smoothing,
         plane_resolution_mm=args.plane_resolution_mm,
         slab_half_width_mm=args.slab_half_width_mm,
         vertical_margin_mm=args.vertical_margin_mm,
         endpoint_extension_mm=args.endpoint_extension_mm,
-        projection_mode=args.projection_mode,
-        projection_percentile=args.projection_percentile,
-        apply_clahe=not args.no_clahe,
-        clahe_clip_limit=args.clahe_clip_limit,
+        projection_beta=args.projection_beta,
+        mu_air=args.mu_air,
+        hu_dense_knee=args.hu_dense_knee,
+        dense_scale_hu=args.dense_scale_hu,
+        dense_gain=args.dense_gain,
+        tone_gamma=args.tone_gamma,
+        intensity_clip_low_pct=args.clip_low,
+        intensity_clip_high_pct=args.clip_high,
+        local_contrast_sigma_px=args.local_contrast_sigma,
+        local_contrast_target_std=args.local_contrast_target_std,
+        apply_local_contrast=not args.no_local_contrast,
+        unsharp_amount=args.unsharp_amount,
+        unsharp_sigma_px=args.unsharp_sigma,
         crop_oob_threshold=args.crop_oob_threshold,
         crop_margin_rows=args.crop_margin_rows,
         flip_horizontal=not args.no_flip,
+        overlay=args.overlay,
         save_debug=args.debug,
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Reconstruct a panoramic image from CBCT + tooth segmentation.")
-    parser.add_argument("--raw", required=True, type=Path)
-    parser.add_argument("--seg", required=True, type=Path)
-    parser.add_argument("--output-dir", required=True, type=Path)
+def _add_config_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default=PanoramaConfig.device,
+                        help="compute backend (auto picks the GPU if visible)")
     parser.add_argument("--spline-resolution", type=int, default=PanoramaConfig.spline_resolution)
-    parser.add_argument("--spline-smoothing", type=float, default=None,
-                        help="None → auto from arc length")
+    parser.add_argument("--spline-smoothing", type=float, default=None, help="None → auto from arc length")
     parser.add_argument("--plane-resolution-mm", type=float, default=PanoramaConfig.plane_resolution_mm)
     parser.add_argument("--slab-half-width-mm", type=float, default=PanoramaConfig.slab_half_width_mm)
     parser.add_argument("--vertical-margin-mm", type=float, default=PanoramaConfig.vertical_margin_mm)
     parser.add_argument("--endpoint-extension-mm", type=float, default=PanoramaConfig.endpoint_extension_mm)
-    parser.add_argument("--projection-mode", choices=("xray", "mip", "percentile", "mean"), default=PanoramaConfig.projection_mode)
-    parser.add_argument("--projection-percentile", type=float, default=PanoramaConfig.projection_percentile)
-    parser.add_argument("--no-clahe", action="store_true")
-    parser.add_argument("--clahe-clip-limit", type=float, default=PanoramaConfig.clahe_clip_limit)
+    parser.add_argument("--projection-beta", type=float, default=PanoramaConfig.projection_beta,
+                        help="U-weight peakiness: 1=sharp/shallow, 0=deep/flat")
+    parser.add_argument("--mu-air", type=float, default=PanoramaConfig.mu_air,
+                        help="attenuation floor: >0 keeps sinus/airway grey not black")
+    parser.add_argument("--hu-dense-knee", type=float, default=PanoramaConfig.hu_dense_knee,
+                        help="HU where enamel/metal log-compression starts")
+    parser.add_argument("--dense-scale-hu", type=float, default=PanoramaConfig.dense_scale_hu)
+    parser.add_argument("--dense-gain", type=float, default=PanoramaConfig.dense_gain)
+    parser.add_argument("--tone-gamma", type=float, default=PanoramaConfig.tone_gamma,
+                        help="<1 lifts shadows/mid — main 'show all features' lever")
+    parser.add_argument("--clip-low", type=float, default=PanoramaConfig.intensity_clip_low_pct)
+    parser.add_argument("--clip-high", type=float, default=PanoramaConfig.intensity_clip_high_pct)
+    parser.add_argument("--local-contrast-sigma", type=float, default=PanoramaConfig.local_contrast_sigma_px)
+    parser.add_argument("--local-contrast-target-std", type=float, default=PanoramaConfig.local_contrast_target_std)
+    parser.add_argument("--no-local-contrast", action="store_true")
+    parser.add_argument("--unsharp-amount", type=float, default=PanoramaConfig.unsharp_amount)
+    parser.add_argument("--unsharp-sigma", type=float, default=PanoramaConfig.unsharp_sigma_px)
     parser.add_argument("--crop-oob-threshold", type=float, default=PanoramaConfig.crop_oob_threshold)
     parser.add_argument("--crop-margin-rows", type=int, default=PanoramaConfig.crop_margin_rows)
     parser.add_argument("--no-flip", action="store_true")
+    parser.add_argument("--overlay", action="store_true",
+                        help="also write an RGB overlay tinting canals (red) and tooth outlines (cyan)")
     parser.add_argument("--debug", action="store_true")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Reconstruct a panoramic (OPG) from CBCT + tooth segmentation.")
+    parser.add_argument("--raw", required=True, type=Path)
+    parser.add_argument("--seg", required=True, type=Path)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    _add_config_args(parser)
     args = parser.parse_args()
 
     report = reconstruct_case(args.raw, args.seg, args.output_dir, _config_from_args(args))
@@ -1065,7 +1543,8 @@ def main() -> None:
         "panoramic_png": report["panoramic_png"],
         "geometry": report["geometry"],
         "sampling_qc": {k: report["sampling_qc"][k] for k in (
-            "height_pixels", "columns", "v_min_mm", "v_max_mm", "out_of_bounds_fraction"
+            "backend", "device", "reconstruct_seconds", "height_pixels", "columns",
+            "v_min_mm", "v_max_mm", "out_of_bounds_fraction"
         ) if k in report["sampling_qc"]},
     }), indent=2))
 

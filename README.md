@@ -1,132 +1,135 @@
-# cbct_v2 — CBCT → Panoramic
+# cbct2panoramic — CBCT → Panoramic (OPG), GPU-accelerated
 
-Synthesises a clinical-style panoramic (OPG) PNG from a CBCT volume and a
-matching FDI-labelled tooth/jaw segmentation. The pipeline is a
-**single-curve curved-MPR (CMPR)**: one 2-D dental-arch spline fitted in the
-axial plane, swept across a tall vertical slab that covers maxilla through
-mandible, projected through the slab into one continuous panoramic image.
+Synthesises a clinical-style panoramic radiograph (OPG / orthopantomogram) from a
+CBCT volume and a matching FDI-labelled tooth/jaw segmentation.
+
+The pipeline is a **curved planar reformat (CMPR)** along the dental arch, projected
+as an **accumulated-attenuation path integral** (film-positive: dense structures are
+bright). Sampling and projection run on the **GPU** via `torch.nn.functional.grid_sample`
+— a standard op, **no custom CUDA kernels** — so the same code runs on **AMD (ROCm)**
+and **NVIDIA (CUDA)** hardware, and on CPU as a fallback.
 
 ```
-                    sampling slab (≈14 mm thick, swept along the arch)
+                    curved focal trough (swept along the dental arch)
                   ┌────────────────────────────────────────────────┐
-       maxilla    │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
-                  │░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│  ▲  V (down_axis)
-       teeth      │░░██████████████████████████████████████████░░░░│  │
-                  │░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│
-       mandible   │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+   condyle/TMJ →  │ ░░░░░░░░░░░░░░ maxilla / sinuses ░░░░░░░░░░░░░░ │  ▲  V (supero-inferior)
+       teeth      │░░██████████████ both arches █████████████████░░│  │
+   mandible →     │ ░░░░░░░░░░░ body / canal / ramus ░░░░░░░░░░░░░░ │
                   └────────────────────────────────────────────────┘
-                       ↑ axial-plane spline (centerline), perpendicular U
+        per column: integrate attenuation across the bucco-lingual (U) trough
 ```
 
-The arch spline is anchored on the **mean position per FDI tooth slot** —
-upper and lower teeth in the same slot are voxel-weighted-averaged into one
-anchor, and obvious single-anchor outliers (e.g. tiny mis-segmented remnants)
-are patched by a local-parabola fit before `scipy.interpolate.splprep` runs.
+## Why the segmentation is needed (and how it is used)
 
-The segmentation is geometry input only: nothing about it is rasterised into
-the final image. The slab is sampled directly from the raw CBCT and projected
-with the configured `--projection-mode` (defaults to `xray`, a path-integrated
-attenuation that reproduces clinical OPG contrast and preserves pulp/canal
-visibility — see "Projection modes" below).
+The segmentation is used **for geometry only — never rasterised into the grayscale
+image.** All displayed pixels come from the raw, unmasked CBCT. Specifically it drives:
 
----
+1. the **dental-arch spline** — anchored on per-FDI-slot tooth centroids (permanent and
+   deciduous, so mixed/primary dentition works);
+2. the **supero-inferior axis** (upper- vs lower-tooth centroid difference);
+3. the **vertical slab extent** (jaws, canals, teeth, sinuses);
+4. the optional **color overlay** (`--overlay`): canals and tooth outlines tinted.
 
-## Layout
+Fitting the arch from raw CBCT alone (bone thresholding) is far less robust than using
+a SOTA tooth segmentation's clean per-tooth centroids — hence the dependency.
 
-```
-cbct_panorama.py        # the pipeline (library + CLI)
-run_local_cases.py      # batch driver for raw/*.nii.gz + seg/*.nii.gz pairs
-requirements.txt        # pinned package floors
-aim_result.png          # reference target image
-cbct_panoramic_prompt.md  # original spec
-raw/                    # CBCT NIfTIs (gitignored — keep your data here)
-seg/                    # FDI-labelled segmentation NIfTIs (gitignored)
-outputs/                # generated panoramics + QC (gitignored)
-```
+## Install (uv)
 
-Drop matching pairs into `raw/<case_id>_0000.nii.gz` and
-`seg/<case_id>.nii.gz` for the batch driver to pick them up.
+Requires [`uv`](https://docs.astral.sh/uv/). PyTorch wheels are hardware-specific, so
+install torch from the matching index:
 
-## Install
+**AMD (ROCm)** — developed against an AMD Radeon AI PRO R9700 (RDNA4) on ROCm 7.x:
 
 ```bash
-python -m venv .venv
-.venv/bin/pip install -r requirements.txt
+uv venv --python 3.13
+uv pip install numpy scipy nibabel scikit-image Pillow
+uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+# stable alternative that also works on RDNA4:
+#   uv pip install torch --index-url https://download.pytorch.org/whl/rocm6.3
+```
+
+If an older ROCm build doesn't recognise the GPU arch, force it:
+`HSA_OVERRIDE_GFX_VERSION=12.0.0` (RDNA4) or `11.0.0` (RDNA3).
+
+**NVIDIA (CUDA):**
+
+```bash
+uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+```
+
+**CPU only:**
+
+```bash
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+Verify the GPU is visible:
+
+```bash
+uv run python -c "import torch; print(torch.cuda.is_available())"
 ```
 
 ## Run
 
-Three bundled local cases:
+Single case:
 
 ```bash
-.venv/bin/python run_local_cases.py --output-dir outputs/panoramic_v3
+uv run python cbct_panorama.py \
+  --raw  ToothFairy3F_060_0000.nii.gz \
+  --seg  segmentation_60.nii.gz \
+  --output-dir outputs/case_60 \
+  --overlay
 ```
 
-One arbitrary case:
+All matching pairs in a directory (classic `raw/`+`seg/` layout, **or** the flat
+`ToothFairy3*_<N>_0000.nii.gz` + `segmentation_<N>.nii.gz` layout):
 
 ```bash
-.venv/bin/python cbct_panorama.py \
-    --raw  path/to/case_0000.nii.gz \
-    --seg  path/to/case.nii.gz \
-    --output-dir outputs/single_case
+uv run python run_local_cases.py --root /srv/datasets/cbct --output-dir experiments/run1 --overlay
 ```
 
-Add `--debug` to also write an axial-MIP-with-spline overlay and a 5-column
-sample-plane montage alongside the panoramic.
+### Outputs (per case)
 
-## Outputs
+| file | description |
+|------|-------------|
+| `<case>_panoramic.png` | 16-bit grayscale panoramic (production) |
+| `<case>_panoramic_preview.png` | 8-bit preview |
+| `<case>_panoramic_overlay.png` | RGB overlay: canals red, tooth outlines cyan (`--overlay`) |
+| `<case>_qc.json` | config, geometry residuals, device, timing, intensity window |
 
-For each case ID:
+## Key tuning flags
 
-| File                              | Purpose                                          |
-| --------------------------------- | ------------------------------------------------ |
-| `<case_id>_panoramic.png`         | 16-bit panoramic (production)                    |
-| `<case_id>_panoramic_preview.png` | 8-bit preview                                    |
-| `<case_id>_qc.json`               | Spline residuals, sampling QC, intensity window  |
-| `<case_id>_axial_spline.png`*     | Axial MIP with fitted arch overlay (`--debug`)   |
-| `<case_id>_sample_planes.png`*    | 5 evenly-spaced perpendicular planes (`--debug`) |
+Defaults are tuned for **feature clarity**. The knobs most worth adjusting:
 
-## Configuration
+| flag | default | effect |
+|------|---------|--------|
+| `--tone-gamma` | 0.75 | `<1` lifts shadows/mid — the main "show all features" lever |
+| `--projection-beta` | 0.55 | U-weight peakiness: `1`=sharp/shallow, `0`=deep/flat |
+| `--hu-dense-knee` / `--dense-gain` | 2500 / 0.15 | log-compress enamel/metal so it doesn't erase bone contrast |
+| `--mu-air` | 0.002 | attenuation floor — keeps sinus/airway grey, not black |
+| `--slab-half-width-mm` | 9.0 | focal-trough half-thickness (bucco-lingual) |
+| `--endpoint-extension-mm` | 30.0 | how far the trough sweeps back toward the condyles |
+| `--device` | auto | `auto` \| `cuda` \| `cpu` |
 
-All knobs live on `PanoramaConfig` in `cbct_panorama.py`. The CLI mirrors them.
+## How it works (pipeline)
 
-| Field                       | Default   | Purpose                                                                         |
-| --------------------------- | --------- | ------------------------------------------------------------------------------- |
-| `slab_half_width_mm`        | 7.0       | Slab is `±slab_half_width_mm` thick along the perpendicular U axis              |
-| `vertical_margin_mm`        | 6.0       | Extra mm above maxilla / below mandible in the V extent                         |
-| `endpoint_extension_mm`     | 18.0      | Centerline extension past the terminal molars                                   |
-| `projection_mode`           | `xray`    | `xray` (path-integrated attenuation), `mip`, `percentile`, `mean`               |
-| `projection_percentile`     | 96.0      | Used only when `projection_mode="percentile"`                                   |
-| `spline_resolution`         | 1200      | Number of sample columns along the arch                                         |
-| `spline_smoothing`          | `None`    | `splprep` `s`; `None` → `arc_length/40`                                         |
-| `plane_resolution_mm`       | 0.2       | Sampling step in both U and V                                                   |
-| `apply_clahe` / `clahe_clip_limit` | True / 0.01 | Local contrast after percentile-clip normalisation                       |
-| `crop_oob_threshold`        | 0.75      | Rows with ≥75 % out-of-bounds samples are auto-cropped                          |
-| `flip_horizontal`           | True      | Patient-right on the image-left (clinical OPG convention)                       |
-| `min_tooth_voxels`          | 50        | Minimum segmented voxels for a tooth to count as a centroid                     |
+`reconstruct_case` (`cbct_panorama.py`):
 
-### Projection modes
+1. **Geometry (CPU, cheap).** `extract_tooth_centroids` → `estimate_down_axis` →
+   `fit_unified_arch` (spline through per-slot anchors, outlier-patched) →
+   `compute_vertical_range`.
+2. **Sampling + projection (GPU).** `sample_project_torch`: builds the `(V,U,C,3)`
+   world-point grid on-device, `grid_sample`s the raw volume (trilinear; out-of-bounds
+   reads as air via a +air shift + zero padding), applies the HU→μ transfer, and
+   integrates `A = Σ_u w(u)·μ` across the trough.
+3. **Tone map (GPU).** `tone_map_torch`: percentile-normalize → gamma shadow-lift →
+   local mean/variance contrast (a torch-native CLAHE substitute) → unsharp.
+4. **Overlay (optional).** `project_segmentation_torch` samples labels through the same
+   trough; canals/tooth outlines are composited onto the grayscale base.
 
-- `xray` (default): each ray through the slab accumulates `max(HU + 1000, 0)/1000 × plane_resolution_mm`. Dense voxels add a lot; low-attenuation cavities (pulp lumen, canal lumen, marrow) add little — the integral preserves them. Closest to a real OPG.
-- `mip`: maximum per ray. Sharpest enamel/cortex but **hides pulp and canal** because a single bright voxel along the ray dominates.
-- `percentile` / `mean`: smoother variants; mostly useful for diagnostics.
+## Notes
 
-## QC summary
-
-The `_qc.json` per case includes:
-
-- `geometry.residuals_mm.max_axial_mm` — max distance from any centroid to the
-  fitted spline, projected to the axial plane. Should be < 4 mm for a clean
-  fit; values much above that flag a missing or grossly mis-positioned tooth.
-- `geometry.residuals_mm.replaced_positions` — FDI slots whose anchor was
-  patched by the local-parabola outlier rule.
-- `sampling_qc.out_of_bounds_fraction` — fraction of slab samples that fell
-  outside the CBCT volume. < 0.30 after auto-crop is healthy.
-
-## Version history
-
-- `v3` (current) — robust anchors (voxel-weighted + local-parabola outlier
-  patch); `xray` attenuation projection by default for visible pulps and
-  canals.
-- `v2` — single-curve CMPR; FDI-position anchoring; auto-cropped vertical
-  extent. Replaces the original two-strip / segmentation-masked output.
+- CBCT HU are uncalibrated ("HU-like"): air ≈ −1000, enamel/metal can exceed 15000. The
+  air floor and percentile window are computed per-volume; the μ knees are heuristics.
+- Volume axis convention is preserved end-to-end; `grid_sample`'s grid uses reversed
+  axis order `(x=W, y=H, z=D)` with `align_corners=True` (see `sample_project_torch`).
