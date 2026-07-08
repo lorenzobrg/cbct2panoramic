@@ -52,10 +52,13 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/panoramic_v3"))
     # forwarded config flags (subset most relevant to batch tuning)
-    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default=PanoramaConfig.device)
+    parser.add_argument("--device", choices=("auto", "cuda"), default=PanoramaConfig.device)
     parser.add_argument("--slab-half-width-mm", type=float, default=PanoramaConfig.slab_half_width_mm)
     parser.add_argument("--vertical-margin-mm", type=float, default=PanoramaConfig.vertical_margin_mm)
     parser.add_argument("--endpoint-extension-mm", type=float, default=PanoramaConfig.endpoint_extension_mm)
+    parser.add_argument("--endpoint-slab-gain", type=float, default=PanoramaConfig.endpoint_slab_gain)
+    parser.add_argument("--no-emphasize-canal", action="store_true")
+    parser.add_argument("--canal-strength", type=float, default=PanoramaConfig.canal_strength)
     parser.add_argument("--projection-beta", type=float, default=PanoramaConfig.projection_beta)
     parser.add_argument("--mu-air", type=float, default=PanoramaConfig.mu_air)
     parser.add_argument("--hu-dense-knee", type=float, default=PanoramaConfig.hu_dense_knee)
@@ -86,6 +89,9 @@ def main() -> None:
         slab_half_width_mm=args.slab_half_width_mm,
         vertical_margin_mm=args.vertical_margin_mm,
         endpoint_extension_mm=args.endpoint_extension_mm,
+        endpoint_slab_gain=args.endpoint_slab_gain,
+        emphasize_canal=not args.no_emphasize_canal,
+        canal_strength=args.canal_strength,
         projection_beta=args.projection_beta,
         mu_air=args.mu_air,
         hu_dense_knee=args.hu_dense_knee,

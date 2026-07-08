@@ -7,7 +7,8 @@ The pipeline is a **curved planar reformat (CMPR)** along the dental arch, proje
 as an **accumulated-attenuation path integral** (film-positive: dense structures are
 bright). Sampling and projection run on the **GPU** via `torch.nn.functional.grid_sample`
 — a standard op, **no custom CUDA kernels** — so the same code runs on **AMD (ROCm)**
-and **NVIDIA (CUDA)** hardware, and on CPU as a fallback.
+and **NVIDIA (CUDA)** hardware. The pipeline is **GPU-only**: it requires a visible GPU
+(`torch.cuda.is_available()`), there is no CPU fallback.
 
 ```
                     curved focal trough (swept along the dental arch)
@@ -21,14 +22,19 @@ and **NVIDIA (CUDA)** hardware, and on CPU as a fallback.
 
 ## Why the segmentation is needed (and how it is used)
 
-The segmentation is used **for geometry only — never rasterised into the grayscale
-image.** All displayed pixels come from the raw, unmasked CBCT. Specifically it drives:
+The segmentation is used **mostly for geometry** — grayscale intensities come from the
+raw, unmasked CBCT. Specifically it drives:
 
 1. the **dental-arch spline** — anchored on per-FDI-slot tooth centroids (permanent and
    deciduous, so mixed/primary dentition works);
 2. the **supero-inferior axis** (upper- vs lower-tooth centroid difference);
-3. the **vertical slab extent** (jaws, canals, teeth, sinuses);
-4. the optional **color overlay** (`--overlay`): canals and tooth outlines tinted.
+3. the **vertical slab extent** — driven by the jaw labels present (mandible/maxilla),
+   unioned with teeth/canals, so whichever arches exist are framed complete and a scan
+   missing the upper teeth is not clipped;
+4. the **canal emphasis** (`--canal-strength`, default on): the mandibular-canal label
+   modulates μ so the ~2 mm lumen reads as a dark tube instead of averaging away — the one
+   place the segmentation touches grayscale (disable with `--no-emphasize-canal`);
+5. the optional **color overlay** (`--overlay`): canals and tooth outlines tinted.
 
 Fitting the arch from raw CBCT alone (bone thresholding) is far less robust than using
 a SOTA tooth segmentation's clean per-tooth centroids — hence the dependency.
@@ -57,13 +63,7 @@ If an older ROCm build doesn't recognise the GPU arch, force it:
 uv pip install torch --index-url https://download.pytorch.org/whl/cu124
 ```
 
-**CPU only:**
-
-```bash
-uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-```
-
-Verify the GPU is visible:
+Verify the GPU is visible (required — the pipeline errors out with no GPU):
 
 ```bash
 uv run python -c "import torch; print(torch.cuda.is_available())"
@@ -109,7 +109,9 @@ Defaults are tuned for **feature clarity**. The knobs most worth adjusting:
 | `--mu-air` | 0.002 | attenuation floor — keeps sinus/airway grey, not black |
 | `--slab-half-width-mm` | 9.0 | focal-trough half-thickness (bucco-lingual) |
 | `--endpoint-extension-mm` | 30.0 | how far the trough sweeps back toward the condyles |
-| `--device` | auto | `auto` \| `cuda` \| `cpu` |
+| `--endpoint-slab-gain` | 1.6 | posterior trough widening toward the condyles (`1`=off) |
+| `--canal-strength` / `--no-emphasize-canal` | 0.5 / on | darken the mandibular canal by modulating μ with the canal label |
+| `--device` | auto | `auto` \| `cuda` (GPU only — no CPU fallback) |
 
 ## How it works (pipeline)
 

@@ -91,11 +91,12 @@ class PanoramaConfig:
     spline_smoothing: float | None = None   # None → auto from arc length
     plane_resolution_mm: float = 0.2
     slab_half_width_mm: float = 9.0
-    vertical_margin_mm: float = 8.0
+    vertical_margin_mm: float = 12.0
     endpoint_extension_mm: float = 30.0     # sweep back to the condyles/TMJ
+    endpoint_slab_gain: float = 1.6         # trough widening at the posterior tips
 
-    # -- compute backend --
-    device: str = "auto"                    # auto | cuda | cpu
+    # -- compute backend (GPU only) --
+    device: str = "auto"                    # auto | cuda — both require a visible GPU
 
     # -- HU → linear attenuation (mu) transfer --
     # Piecewise, continuous, monotonic. Air/soft tissue keep a small non-zero
@@ -127,11 +128,12 @@ class PanoramaConfig:
     unsharp_amount: float = 0.5
     unsharp_sigma_px: float = 3.5
 
-    # -- legacy CPU projection knobs (kept for the parity test only) --
-    projection_mode: str = "xray"           # xray | mip | percentile | mean
-    projection_percentile: float = 96.0
-    apply_clahe: bool = False
-    clahe_clip_limit: float = 0.01
+    # -- canal emphasis --
+    # The mandibular canal is a ~2 mm lucent tube; averaged over an 18 mm slab it
+    # vanishes. When on, its label modulates the grayscale μ (μ *= 1-strength
+    # inside the projected canal mask) so it reads as a dark corticated tube.
+    emphasize_canal: bool = True
+    canal_strength: float = 0.5
 
     crop_oob_threshold: float = 0.75
     crop_margin_rows: int = 6
@@ -163,9 +165,9 @@ class ArchGeometry:
     # encoded as per-column *lateral offsets* along ``width_axis``: at column c,
     # the upper arch sits ``lateral_offset_upper_mm[c]`` away from the unified
     # curve and the lower arch sits ``lateral_offset_lower_mm[c]`` away — both
-    # measured in the axial plane. ``sample_panorama`` blends these two offsets
-    # by V so upper-tooth-band rows sample the upper-arch position and lower-
-    # tooth-band rows sample the lower-arch position.
+    # measured in the axial plane. ``sample_project_torch`` blends these two
+    # offsets by V so upper-tooth-band rows sample the upper-arch position and
+    # lower-tooth-band rows sample the lower-arch position.
     centerline_world: np.ndarray         # (N, 3) unified curve, in 3D
     tangent: np.ndarray                  # (N, 3) unit, in axial plane
     width_axis: np.ndarray               # (N, 3) unit, in axial plane (perpendicular)
@@ -176,6 +178,10 @@ class ArchGeometry:
     v_lower_mm: float                    # mean V of lower arch
     residuals_mm: dict[str, Any]
     vertical_range_mm: tuple[float, float]
+    # Per-column multiplier on the bucco-lingual trough half-width. 1.0 over the
+    # dentition, ramping up toward the posterior tips so residual drift off the
+    # curving mandible still captures the body/ramus.
+    column_slab_gain: np.ndarray
     # Per-arch curves kept around so debug plots can show them; not used by the
     # main sampler.
     upper_centerline_world: np.ndarray
@@ -361,21 +367,6 @@ def _drop_terminal_gap_outliers(points: np.ndarray, config: PanoramaConfig) -> t
     return points[start:end], start, len(points) - end
 
 
-def _extend_centerline(centerline: np.ndarray, tangent: np.ndarray, extension_mm: float) -> tuple[np.ndarray, np.ndarray]:
-    if extension_mm <= 0 or len(centerline) < 2:
-        return centerline, tangent
-    mean_step = float(np.mean(np.linalg.norm(np.diff(centerline, axis=0), axis=1)))
-    if not np.isfinite(mean_step) or mean_step <= 1e-6:
-        return centerline, tangent
-    n_ext = max(1, int(math.ceil(extension_mm / mean_step)))
-    distances = np.linspace(extension_mm, mean_step, n_ext)
-    pre = centerline[0][None, :] - distances[:, None] * tangent[0][None, :]
-    post = centerline[-1][None, :] + distances[::-1, None] * tangent[-1][None, :]
-    pre_t = np.repeat(tangent[0][None, :], n_ext, axis=0)
-    post_t = np.repeat(tangent[-1][None, :], n_ext, axis=0)
-    return np.vstack([pre, centerline, post]), np.vstack([pre_t, tangent, post_t])
-
-
 def _anchors_by_arch_position(
     centroids: list[ToothCentroid], down_axis: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -472,6 +463,13 @@ class _BaseArchFit:
     mean_v_world: float
     residuals: dict[str, Any]
     centroid_world: np.ndarray
+    # Fitted B-spline + axial basis, kept so the posterior sweep can be
+    # extended *along the arch's own curvature* (splev past u∈[0,1]) instead of
+    # flying off on a straight terminal tangent.
+    tck: Any
+    e1: np.ndarray
+    e2: np.ndarray
+    du: float                # u-step between interior samples (1/(res-1))
 
 
 def _fit_arch_base(
@@ -554,20 +552,46 @@ def _fit_arch_base(
         mean_v_world=mean_v,
         residuals=residuals,
         centroid_world=centroid_world,
+        tck=tck,
+        e1=e1,
+        e2=e2,
+        du=1.0 / max(int(config.spline_resolution) - 1, 1),
     )
 
 
 def _extend_with_count(
-    centerline: np.ndarray, tangent: np.ndarray, n_ext: int, step_mm: float
+    base: _BaseArchFit, down_axis: np.ndarray, n_ext: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    if n_ext <= 0 or len(centerline) < 2 or step_mm <= 1e-6:
+    """Extend the arch past both terminal molars by continuing the *fitted
+    B-spline's curvature* (evaluate ``splev`` at u<0 and u>1) rather than a
+    straight terminal tangent. The posterior mandible curves lingually toward
+    the ramus, so a straight extrapolation drifts off the bone and the body
+    fades on the left/right; following the spline keeps the trough on it.
+    """
+    centerline, tangent = base.centerline, base.tangent
+    if n_ext <= 0 or len(centerline) < 2 or base.du <= 0:
         return centerline, tangent
-    distances = np.arange(n_ext, dtype=np.float64) * step_mm + step_mm
-    pre = centerline[0][None, :] - distances[::-1, None] * tangent[0][None, :]
-    post = centerline[-1][None, :] + distances[:, None] * tangent[-1][None, :]
-    pre_t = np.repeat(tangent[0][None, :], n_ext, axis=0)
-    post_t = np.repeat(tangent[-1][None, :], n_ext, axis=0)
-    return np.vstack([pre, centerline, post]), np.vstack([pre_t, tangent, post_t])
+
+    vertical_axis = _normalize(down_axis)
+    mean_v = base.mean_v_world
+    du = base.du
+
+    def _eval(u_ext: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        c2d = np.array(splev(u_ext, base.tck), dtype=np.float64).T          # (n,2)
+        d2d = np.array(splev(u_ext, base.tck, der=1), dtype=np.float64).T   # (n,2)
+        c3d = c2d[:, 0:1] * base.e1[None, :] + c2d[:, 1:2] * base.e2[None, :]
+        c3d = c3d + mean_v * vertical_axis[None, :]
+        t3d = _normalize(d2d[:, 0:1] * base.e1[None, :] + d2d[:, 1:2] * base.e2[None, :])
+        return c3d, t3d
+
+    # u grows toward the terminal molar at u=1 and u=0; step outward by du.
+    pre_u = (np.arange(n_ext, dtype=np.float64) + 1.0)[::-1] * (-du)        # -n·du … -du
+    post_u = (np.arange(n_ext, dtype=np.float64) + 1.0) * du + 1.0          # 1+du … 1+n·du
+    pre_c, pre_t = _eval(pre_u)
+    post_c, post_t = _eval(post_u)
+    centerline = np.vstack([pre_c, centerline, post_c])
+    tangent = np.vstack([pre_t, tangent, post_t])
+    return centerline, tangent
 
 
 def _finalize_arch(
@@ -576,7 +600,7 @@ def _finalize_arch(
     n_ext: int,
     step_mm: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, dict[str, Any]]:
-    centerline, tangent = _extend_with_count(base.centerline, base.tangent, n_ext, step_mm)
+    centerline, tangent = _extend_with_count(base, down_axis, n_ext)
     vertical_axis = _normalize(down_axis)
     width_axis = _normalize(np.cross(vertical_axis[None, :].repeat(len(tangent), axis=0), tangent))
 
@@ -614,6 +638,16 @@ def fit_unified_arch(
         unified_base, down_axis, n_ext, unified_base.mean_step_mm
     )
     vertical_axis = _normalize(down_axis)
+
+    # Posterior slab-width taper: the first/last n_ext columns are the condyle
+    # sweep, where the trough can drift off the curving mandible — widen it there
+    # (ramp 1.0 → endpoint_slab_gain toward each tip) so the body stays captured.
+    column_slab_gain = np.ones(len(centerline), dtype=np.float64)
+    gain = float(config.endpoint_slab_gain)
+    if n_ext > 0 and gain != 1.0 and 2 * n_ext < len(centerline):
+        ramp = np.linspace(gain, 1.0, n_ext, endpoint=False)
+        column_slab_gain[:n_ext] = ramp
+        column_slab_gain[len(centerline) - n_ext:] = ramp[::-1]
 
     # Project the unified centerline to the axial plane and find, for each
     # column, the nearest point on each per-arch curve. The signed projection
@@ -680,6 +714,7 @@ def fit_unified_arch(
         v_lower_mm=v_lower,
         residuals_mm=residuals,
         vertical_range_mm=(0.0, 0.0),  # placeholder, filled by compute_vertical_range
+        column_slab_gain=column_slab_gain,
         upper_centerline_world=upper_curve,
         lower_centerline_world=lower_curve,
     )
@@ -703,7 +738,6 @@ def compute_vertical_range(
     raw_shape: tuple[int, int, int],
     config: PanoramaConfig,
 ) -> ArchGeometry:
-    coords = _coords_for_labels(seg, EXTENT_LABELS, config.max_extent_samples)
     down = geometry.vertical_axis
     margin = float(config.vertical_margin_mm)
 
@@ -713,11 +747,18 @@ def compute_vertical_range(
     # aligned down axis which otherwise lets EXTENT_LABELS span 100 mm.
     v_center = float(np.mean(geometry.centerline_world @ down))
 
+    # Full-jaw, no-clip framing: drive the V band from the jaw labels that are
+    # actually present (1=mandible, 2=maxilla), unioned with the tooth/canal
+    # extent, using tolerant percentiles (0.1/99.9) that reject a stray voxel
+    # while keeping the whole bone. Whichever jaws exist are shown complete; a
+    # missing jaw (e.g. an upper-teeth-less scan) reserves no empty band because
+    # its label contributes no coordinates.
+    coords = _coords_for_labels(seg, EXTENT_LABELS, config.max_extent_samples)
     if coords.size:
         world = _apply_affine(affine, coords)
         rel = world @ down - v_center
-        low = float(np.percentile(rel, 0.5)) - margin
-        high = float(np.percentile(rel, 99.5)) + margin
+        low = float(np.percentile(rel, 0.1)) - margin
+        high = float(np.percentile(rel, 99.9)) + margin
     else:
         low, high = -40.0, 40.0
 
@@ -729,9 +770,14 @@ def compute_vertical_range(
     v_corners = corners_world @ down - v_center
     low = max(low, float(np.min(v_corners)))
     high = min(high, float(np.max(v_corners)))
-    if high - low < 30.0:
+    # A full jaw spans ~70-90 mm; never let the band collapse below a floor that
+    # would clip a whole arch. Clamped afterwards to the volume corners.
+    min_span = 60.0
+    if high - low < min_span:
         mid = 0.5 * (low + high)
-        low, high = mid - 30.0, mid + 30.0
+        low, high = mid - 0.5 * min_span, mid + 0.5 * min_span
+        low = max(low, float(np.min(v_corners)))
+        high = min(high, float(np.max(v_corners)))
 
     return ArchGeometry(
         centerline_world=geometry.centerline_world,
@@ -744,55 +790,13 @@ def compute_vertical_range(
         v_lower_mm=geometry.v_lower_mm,
         residuals_mm=geometry.residuals_mm,
         vertical_range_mm=(float(low), float(high)),
+        column_slab_gain=geometry.column_slab_gain,
         upper_centerline_world=geometry.upper_centerline_world,
         lower_centerline_world=geometry.lower_centerline_world,
     )
 
 
 # -- sampling ----------------------------------------------------------------
-
-
-def _hu_band_shape(sampled: np.ndarray) -> np.ndarray:
-    """Piecewise gain on HU so dentin/cortex sit in the mid-range instead of
-    being washed out by enamel/restoration saturation.
-
-    - air / soft tissue (<200 HU) → low (near zero) so the background stays dark
-    - bone (200..1800 HU)         → linear ramp (most of the dynamic range)
-    - very dense (>1800 HU)       → log-compressed so enamel/restorations don't
-                                     blow out and erase cortical bone contrast
-
-    The output is a unitless attenuation surrogate; mean over the slab gives an
-    OPG-like path integral with much stronger bone/dentin separation than the
-    raw `(HU+1000)/1000` ramp.
-    """
-    s = sampled.astype(np.float32, copy=False)
-    low = np.clip((s - (-200.0)) / 400.0, 0.0, 1.0) * 0.05  # soft tissue floor
-    bone = np.clip((s - 200.0) / 1600.0, 0.0, 1.0)           # 0..1 over 200..1800
-    dense_excess = np.maximum(s - 1800.0, 0.0)
-    dense = np.log1p(dense_excess / 1500.0) * 0.4            # compressed tail
-    return low + bone + dense
-
-
-def _project_slab(
-    sampled: np.ndarray, config: PanoramaConfig, slab_weights: np.ndarray | None = None
-) -> np.ndarray:
-    mode = config.projection_mode.lower()
-    if mode == "xray":
-        # Path-integrated, HU-shaped, cosine-weighted along U so the spline-
-        # centred voxels dominate. The cosine weighting sharpens enamel and
-        # canal walls without becoming pure MIP (which erases the canal lumen).
-        shaped = _hu_band_shape(sampled)
-        if slab_weights is None or slab_weights.shape[0] != shaped.shape[1]:
-            return shaped.mean(axis=1).astype(np.float32, copy=False)
-        w = slab_weights.astype(np.float32).reshape(1, -1, 1)
-        return (shaped * w).sum(axis=1).astype(np.float32, copy=False)
-    if mode == "mip":
-        return sampled.max(axis=1)
-    if mode == "percentile":
-        return np.percentile(sampled, config.projection_percentile, axis=1)
-    if mode == "mean":
-        return sampled.mean(axis=1)
-    raise ValueError(f"Unsupported projection_mode: {config.projection_mode}")
 
 
 def _smoothstep(t: np.ndarray) -> np.ndarray:
@@ -809,17 +813,21 @@ def _smoothstep(t: np.ndarray) -> np.ndarray:
 
 
 def select_device(name: str = "auto") -> "Any":
+    """GPU-only. ``auto`` and ``cuda`` both require a visible GPU (CUDA or ROCm,
+    which torch exposes through the same ``torch.cuda`` API); there is no CPU
+    fallback — this pipeline is GPU-only by design."""
     import torch
 
     name = (name or "auto").lower()
-    if name == "cpu":
-        return torch.device("cpu")
-    if name in ("cuda", "gpu"):
-        if not torch.cuda.is_available():
-            raise RuntimeError("device='cuda' requested but no GPU is visible to torch.")
-        return torch.device("cuda")
-    # auto
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if name not in ("auto", "cuda", "gpu"):
+        raise ValueError(f"device must be 'auto' or 'cuda' (GPU-only); got {name!r}.")
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "No GPU is visible to torch. This pipeline is GPU-only — install a "
+            "CUDA/ROCm torch build and ensure a device is visible "
+            "(torch.cuda.is_available() must be True)."
+        )
+    return torch.device("cuda")
 
 
 def _row_blend(geometry: ArchGeometry, v_values: np.ndarray) -> np.ndarray:
@@ -886,14 +894,22 @@ def sample_project_torch(
     geometry: ArchGeometry,
     config: PanoramaConfig,
     device: "Any | None" = None,
+    seg: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Sample the curved slab and project it to an accumulated-attenuation
-    panorama on the selected torch device. Returns (A[V,C] float32, qc)."""
+    panorama on the selected torch device. Returns (A[V,C] float32, qc).
+
+    When ``config.emphasize_canal`` and ``seg`` is given, the mandibular-canal
+    labels are sampled through the same trough and used to knock down μ inside
+    the canal lumen, so the ~2 mm tube reads as a dark corticated channel instead
+    of being averaged away across the slab."""
     import torch
     import torch.nn.functional as F
 
     if device is None:
         device = select_device(config.device)
+
+    use_canal = bool(config.emphasize_canal) and seg is not None and float(config.canal_strength) > 0.0
 
     air_value = float(np.nanpercentile(raw, 0.5))
     u_values = _grid_values(-config.slab_half_width_mm, config.slab_half_width_mm, config.plane_resolution_mm)
@@ -916,6 +932,7 @@ def sample_project_torch(
     upper_off = torch.as_tensor(geometry.lateral_offset_upper_mm, dtype=torch.float32, device=device)  # (C,)
     lower_off = torch.as_tensor(geometry.lateral_offset_lower_mm, dtype=torch.float32, device=device)  # (C,)
     offset_vc = (1.0 - t_row)[:, None] * upper_off[None, :] + t_row[:, None] * lower_off[None, :]   # (V,C)
+    col_gain = torch.as_tensor(geometry.column_slab_gain, dtype=torch.float32, device=device)       # (C,)
 
     # Raised-cosine slab weight w(u), normalized (weighted mean over U).
     if U > 1:
@@ -931,6 +948,11 @@ def sample_project_torch(
     I, J, K = raw.shape
     size = torch.as_tensor([I - 1, J - 1, K - 1], dtype=torch.float32, device=device)
 
+    if use_canal:
+        vol_seg = torch.as_tensor(np.ascontiguousarray(seg, dtype=np.float32), device=device)[None, None]
+        canal_set = torch.as_tensor(LOWER_CANAL_LABELS, dtype=torch.float32, device=device)
+        canal_k = float(config.canal_strength)
+
     A = torch.empty((V, C), dtype=torch.float32, device=device)
     row_oob = np.zeros(V, dtype=np.int64)
     row_total = np.zeros(V, dtype=np.int64)
@@ -943,7 +965,8 @@ def sample_project_torch(
         cc = end - start
         centers = centerline[start:end]                # (cc,3)
         w_axis = width_axis[start:end]                 # (cc,3)
-        u_total = offset_vc[:, None, start:end] + u_t[None, :, None]     # (V,U,cc)
+        g = col_gain[start:end]                         # (cc,) posterior trough widening
+        u_total = offset_vc[:, None, start:end] + u_t[None, :, None] * g[None, None, :]   # (V,U,cc)
         # world point (V,U,cc,3)
         pts = (
             centers[None, None, :, :]
@@ -968,6 +991,14 @@ def sample_project_torch(
         sampled = F.grid_sample(vol, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
         sampled = sampled[0, 0] + air_value            # (V,U,cc) HU
         mu = _hu_to_mu_torch(sampled, config)          # (V,U,cc)
+
+        if use_canal:
+            # Nearest-sample the canal label through the same grid and drop μ
+            # inside the lumen so it accumulates as a dark tube.
+            lab = F.grid_sample(vol_seg, grid, mode="nearest", padding_mode="zeros", align_corners=True)[0, 0]
+            is_canal = (torch.round(lab)[..., None] == canal_set).any(dim=-1)   # (V,U,cc) bool
+            mu = mu * (1.0 - canal_k * is_canal.to(mu.dtype))
+
         A[:, start:end] = torch.einsum("vuc,u->vc", mu, w)
 
     A_cpu = A.to("cpu").numpy().astype(np.float32)
@@ -1058,112 +1089,6 @@ def tone_map_torch(A: np.ndarray, config: PanoramaConfig, device: "Any | None" =
     return out, {"low": float(lo), "high": float(hi)}
 
 
-def sample_panorama(
-    raw: np.ndarray,
-    affine: np.ndarray,
-    geometry: ArchGeometry,
-    config: PanoramaConfig,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    inv_affine = np.linalg.inv(affine)
-    air_value = float(np.nanpercentile(raw, 0.5))
-    u_values = _grid_values(-config.slab_half_width_mm, config.slab_half_width_mm, config.plane_resolution_mm)
-    v_min, v_max = geometry.vertical_range_mm  # offsets from centerline V
-    v_values = _grid_values(v_min, v_max, config.plane_resolution_mm)
-    height = len(v_values)
-    slab_width = len(u_values)
-    columns = len(geometry.centerline_world)
-    panorama = np.empty((height, columns), dtype=np.float32)
-
-    shape_limit = np.array(raw.shape, dtype=np.float64) - 1.0
-    total = 0
-    oob_total = 0
-    row_oob = np.zeros(height, dtype=np.int64)
-    row_total = np.zeros(height, dtype=np.int64)
-
-    v_axis = geometry.vertical_axis
-    centerline = geometry.centerline_world
-    width_axis = geometry.width_axis
-
-    # Per-row blend factor expressed in V offsets relative to the unified
-    # centerline. The unified centerline sits at mean tooth V, so:
-    #   t = 0 at V offset = v_upper_mm - v_center  (upper-tooth band)
-    #   t = 1 at V offset = v_lower_mm - v_center  (lower-tooth band)
-    v_center = float(np.mean(centerline @ v_axis))
-    v_upper_rel = float(geometry.v_upper_mm) - v_center
-    v_lower_rel = float(geometry.v_lower_mm) - v_center
-    denom = v_lower_rel - v_upper_rel
-    if abs(denom) < 1e-6:
-        t_row = np.zeros(height, dtype=np.float64)
-    else:
-        t_row = _smoothstep((v_values - v_upper_rel) / denom)
-
-    # Cosine-weighted slab profile for the xray projection — values per U slot.
-    if slab_width > 1:
-        u_norm = u_values / float(config.slab_half_width_mm)
-        slab_weights = np.cos(0.5 * math.pi * np.clip(u_norm, -1.0, 1.0)) ** 2
-    else:
-        slab_weights = np.ones(slab_width, dtype=np.float64)
-    slab_weights = slab_weights.astype(np.float64) / max(float(slab_weights.sum()), 1e-8)
-
-    upper_off = geometry.lateral_offset_upper_mm
-    lower_off = geometry.lateral_offset_lower_mm
-
-    for start in range(0, columns, config.chunk_columns):
-        end = min(columns, start + config.chunk_columns)
-        centers = centerline[start:end]               # (B, 3)
-        w_axis = width_axis[start:end]                # (B, 3)
-
-        # Per-(V, B) lateral offset along width_axis, blended from upper/lower.
-        u_off = upper_off[start:end]                  # (B,)
-        l_off = lower_off[start:end]                  # (B,)
-        # (V, B)
-        offset_vb = (1.0 - t_row)[:, None] * u_off[None, :] + t_row[:, None] * l_off[None, :]
-
-        # (V, U, B, 3): for each (v, u, column), world sample position.
-        # base = centers + (offset_vb + u) * width_axis + v * v_axis
-        u_total = offset_vb[:, None, :, None] + u_values[None, :, None, None]   # (V, U, B, 1)
-        points = (
-            centers[None, None, :, :]
-            + u_total * w_axis[None, None, :, :]
-            + v_values[:, None, None, None] * v_axis[None, None, None, :]
-        )
-        flat = points.reshape(-1, 3)
-        voxel = _apply_affine(inv_affine, flat)
-        oob = np.any((voxel < 0.0) | (voxel > shape_limit[None, :]), axis=1)
-        total += oob.size
-        oob_total += int(oob.sum())
-        oob_grid = oob.reshape(height, slab_width, end - start)
-        row_oob += oob_grid.sum(axis=(1, 2))
-        row_total += slab_width * (end - start)
-
-        sampled = map_coordinates(
-            raw,
-            [voxel[:, 0], voxel[:, 1], voxel[:, 2]],
-            order=1,
-            mode="constant",
-            cval=air_value,
-        ).reshape(height, slab_width, end - start)
-
-        panorama[:, start:end] = _project_slab(sampled, config, slab_weights).astype(np.float32, copy=False)
-
-    qc = {
-        "height_pixels": int(height),
-        "columns": int(columns),
-        "slab_width_pixels": int(slab_width),
-        "v_min_mm": float(v_values[0]),
-        "v_max_mm": float(v_values[-1]),
-        "v_upper_rel_mm": float(v_upper_rel),
-        "v_lower_rel_mm": float(v_lower_rel),
-        "v_center_world_mm": float(v_center),
-        "u_min_mm": float(u_values[0]),
-        "u_max_mm": float(u_values[-1]),
-        "air_value": float(air_value),
-        "out_of_bounds_fraction": float(oob_total / max(total, 1)),
-        "row_out_of_bounds_fraction": (row_oob / np.maximum(row_total, 1)).astype(float).tolist(),
-    }
-    return panorama, qc
-
-
 def crop_oob_rows(panorama: np.ndarray, qc: dict[str, Any], config: PanoramaConfig) -> tuple[np.ndarray, dict[str, Any]]:
     row_oob = np.asarray(qc.get("row_out_of_bounds_fraction", []), dtype=np.float64)
     if row_oob.size != panorama.shape[0]:
@@ -1192,39 +1117,6 @@ def crop_oob_rows(panorama: np.ndarray, qc: dict[str, Any], config: PanoramaConf
         }
     )
     return cropped, qc
-
-
-def normalize_panorama(panorama: np.ndarray, config: PanoramaConfig) -> tuple[np.ndarray, dict[str, float]]:
-    finite = panorama[np.isfinite(panorama)]
-    if finite.size == 0:
-        return np.zeros_like(panorama, dtype=np.float32), {"low": 0.0, "high": 1.0}
-    low, high = np.percentile(finite, [config.intensity_clip_low_pct, config.intensity_clip_high_pct])
-    if not np.isfinite(high) or high <= low:
-        low = float(np.min(finite))
-        high = float(np.max(finite))
-    if high <= low:
-        normalized = np.zeros_like(panorama, dtype=np.float32)
-    else:
-        clipped = np.clip(panorama, low, high)
-        normalized = ((clipped - low) / (high - low)).astype(np.float32)
-    if config.apply_clahe and normalized.size:
-        # Default skimage tile (8×8) is too small for a 1200-wide panoramic
-        # and over-equalises local texture. Aim for ~8 tiles vertical and ~32
-        # horizontal — comparable to clinical OPG sharpening grids.
-        from skimage import exposure
-        h, w = normalized.shape
-        kernel_size = (max(16, h // 8), max(16, w // 32))
-        normalized = exposure.equalize_adapthist(
-            normalized, kernel_size=kernel_size, clip_limit=config.clahe_clip_limit
-        ).astype(np.float32)
-    if config.unsharp_amount > 0.0 and normalized.size:
-        # Post-CLAHE unsharp mask gives the snappy edges of a real OPG without
-        # turning fine cancellous-bone texture into noise.
-        from scipy.ndimage import gaussian_filter
-        blurred = gaussian_filter(normalized, sigma=float(config.unsharp_sigma_px))
-        sharpened = normalized + float(config.unsharp_amount) * (normalized - blurred)
-        normalized = np.clip(sharpened, 0.0, 1.0).astype(np.float32)
-    return normalized, {"low": float(low), "high": float(high)}
 
 
 # -- output ------------------------------------------------------------------
@@ -1266,6 +1158,7 @@ def project_segmentation_torch(
     upper_off = torch.as_tensor(geometry.lateral_offset_upper_mm, dtype=torch.float32, device=device)
     lower_off = torch.as_tensor(geometry.lateral_offset_lower_mm, dtype=torch.float32, device=device)
     offset_vc = (1.0 - t_row)[:, None] * upper_off[None, :] + t_row[:, None] * lower_off[None, :]
+    col_gain = torch.as_tensor(geometry.column_slab_gain, dtype=torch.float32, device=device)
 
     vol = torch.as_tensor(np.ascontiguousarray(seg, dtype=np.float32), device=device)[None, None]
     I, J, K = seg.shape
@@ -1281,7 +1174,8 @@ def project_segmentation_torch(
         end = min(C, start + chunk)
         centers = centerline[start:end]
         w_axis = width_axis[start:end]
-        u_total = offset_vc[:, None, start:end] + u_t[None, :, None]
+        g = col_gain[start:end]
+        u_total = offset_vc[:, None, start:end] + u_t[None, :, None] * g[None, None, :]
         pts = (
             centers[None, None, :, :]
             + u_total[..., None] * w_axis[None, None, :, :]
@@ -1457,7 +1351,7 @@ def reconstruct_case(raw_path: Path, seg_path: Path, output_dir: Path, config: P
 
     device = select_device(config.device)
     t0 = time.time()
-    panorama, sampling_qc = sample_project_torch(raw, affine, geometry, config, device)
+    panorama, sampling_qc = sample_project_torch(raw, affine, geometry, config, device, seg=seg)
     panorama, sampling_qc = crop_oob_rows(panorama, sampling_qc, config)
     top = int(sampling_qc.get("cropped_top_rows", 0))
     bottom = int(sampling_qc.get("cropped_bottom_rows", 0))
@@ -1535,6 +1429,9 @@ def _config_from_args(args: argparse.Namespace) -> PanoramaConfig:
         slab_half_width_mm=args.slab_half_width_mm,
         vertical_margin_mm=args.vertical_margin_mm,
         endpoint_extension_mm=args.endpoint_extension_mm,
+        endpoint_slab_gain=args.endpoint_slab_gain,
+        emphasize_canal=not args.no_emphasize_canal,
+        canal_strength=args.canal_strength,
         projection_beta=args.projection_beta,
         mu_air=args.mu_air,
         hu_dense_knee=args.hu_dense_knee,
@@ -1557,14 +1454,20 @@ def _config_from_args(args: argparse.Namespace) -> PanoramaConfig:
 
 
 def _add_config_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default=PanoramaConfig.device,
-                        help="compute backend (auto picks the GPU if visible)")
+    parser.add_argument("--device", choices=("auto", "cuda"), default=PanoramaConfig.device,
+                        help="compute backend (GPU only; both require a visible GPU)")
     parser.add_argument("--spline-resolution", type=int, default=PanoramaConfig.spline_resolution)
     parser.add_argument("--spline-smoothing", type=float, default=None, help="None → auto from arc length")
     parser.add_argument("--plane-resolution-mm", type=float, default=PanoramaConfig.plane_resolution_mm)
     parser.add_argument("--slab-half-width-mm", type=float, default=PanoramaConfig.slab_half_width_mm)
     parser.add_argument("--vertical-margin-mm", type=float, default=PanoramaConfig.vertical_margin_mm)
     parser.add_argument("--endpoint-extension-mm", type=float, default=PanoramaConfig.endpoint_extension_mm)
+    parser.add_argument("--endpoint-slab-gain", type=float, default=PanoramaConfig.endpoint_slab_gain,
+                        help="posterior trough widening toward the condyles (1=off)")
+    parser.add_argument("--no-emphasize-canal", action="store_true",
+                        help="disable canal-label μ modulation (darkening the mandibular canal)")
+    parser.add_argument("--canal-strength", type=float, default=PanoramaConfig.canal_strength,
+                        help="μ reduction inside the canal lumen (0..1); higher = darker tube")
     parser.add_argument("--projection-beta", type=float, default=PanoramaConfig.projection_beta,
                         help="U-weight peakiness: 1=sharp/shallow, 0=deep/flat")
     parser.add_argument("--mu-air", type=float, default=PanoramaConfig.mu_air,
