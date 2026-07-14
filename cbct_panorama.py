@@ -45,6 +45,10 @@ UPPER_TOOTH_LABELS = UPPER_PERMANENT_LABELS + UPPER_DECIDUOUS_LABELS
 LOWER_TOOTH_LABELS = LOWER_PERMANENT_LABELS + LOWER_DECIDUOUS_LABELS
 UPPER_PULP_LABELS = tuple(label + 100 for label in UPPER_PERMANENT_LABELS)
 LOWER_PULP_LABELS = tuple(label + 100 for label in LOWER_PERMANENT_LABELS)
+# Canonical single pulp label per labels.json ("Teeth Pulps": 50). Some
+# exporters emit per-tooth pulps in the 1xx range instead; normalize_seg_labels
+# collapses those onto this one so pulps are recognized regardless of convention.
+PULP_LABEL = 50
 UPPER_JAW_LABELS = (2,)
 LOWER_JAW_LABELS = (1,)
 LOWER_CANAL_LABELS = (3, 4, 103, 104, 105)
@@ -81,6 +85,7 @@ EXTENT_LABELS = (
     + ALL_TOOTH_LABELS
     + UPPER_PULP_LABELS
     + LOWER_PULP_LABELS
+    + (PULP_LABEL,)
 )
 
 
@@ -94,6 +99,11 @@ class PanoramaConfig:
     vertical_margin_mm: float = 12.0
     endpoint_extension_mm: float = 30.0     # sweep back to the condyles/TMJ
     endpoint_slab_gain: float = 1.6         # trough widening at the posterior tips
+    # Constant physical width per output column. The arch spline is sampled at
+    # uniform parameter u, whose mm-per-u varies along the curve; resampling the
+    # assembled centerline to this fixed arc-length step makes every column the
+    # same mm so the panorama's horizontal scale is uniform (no lateral stretch).
+    column_spacing_mm: float = 0.1
 
     # -- compute backend (GPU only) --
     device: str = "auto"                    # auto | cuda — both require a visible GPU
@@ -228,6 +238,24 @@ def _grid_values(min_value: float, max_value: float, step: float) -> np.ndarray:
 # -- IO ----------------------------------------------------------------------
 
 
+def normalize_seg_labels(seg: np.ndarray) -> np.ndarray:
+    """Collapse per-tooth pulp labels onto the canonical single pulp label.
+
+    labels.json defines pulps as one label (``PULP_LABEL`` = 50), but some
+    exporters emit them per-tooth in the 1xx range (tooth FDI + 100). Map the
+    whole 100-199 range onto ``PULP_LABEL`` *except* the lower-jaw accessory
+    lingual canals 103/104/105, which are a real canal feature we keep and
+    emphasize via ``LOWER_CANAL_LABELS``. The permanent/deciduous tooth labels
+    (11-48, 51-85) are below 100 and untouched, so arch fitting is unaffected."""
+    pulp_range = (seg >= 100) & (seg <= 199)
+    keep_canal = np.isin(seg, LOWER_CANAL_LABELS)
+    to_pulp = pulp_range & ~keep_canal
+    if to_pulp.any():
+        seg = seg.copy()
+        seg[to_pulp] = PULP_LABEL
+    return seg
+
+
 def load_nifti_pair(raw_path: Path, seg_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     raw_img = nib.load(str(raw_path))
     seg_img = nib.load(str(seg_path))
@@ -243,6 +271,7 @@ def load_nifti_pair(raw_path: Path, seg_path: Path) -> tuple[np.ndarray, np.ndar
         seg = np.rint(seg).astype(np.int16)
     else:
         seg = seg.astype(np.int16, copy=False)
+    seg = normalize_seg_labels(seg)
 
     meta = {
         "raw_path": str(raw_path),
@@ -309,6 +338,13 @@ def estimate_down_axis(
         sign_ref = lower.mean(axis=0) - upper.mean(axis=0)
 
     def _orient(v: np.ndarray) -> np.ndarray:
+        # World coordinates are RAS+, so anatomical inferior is world −Z. Orient
+        # the axis to point inferior by its Z sign — robust even when one arch is
+        # nearly absent. (The old lower−upper sign hint then points *anteriorly*,
+        # not inferiorly, and flipped single-arch scans upside down, e.g. seg 44.)
+        if abs(v[2]) > 0.5:
+            return v if v[2] < 0 else -v
+        # Near-horizontal SI axis (unusual head pose): fall back to the tooth hint.
         if sign_ref is not None and np.dot(v, sign_ref) < 0:
             return -v
         if sign_ref is None and np.dot(v, z) < 0:
@@ -453,6 +489,21 @@ def _patch_outlier_anchors(
             new_pts[i] = pred[i]
             replaced.append(int(positions[i]))
     return new_pts, replaced
+
+
+def _resample_arclength(points: np.ndarray, step_mm: float) -> tuple[np.ndarray, np.ndarray]:
+    """Resample a 3-D polyline to a uniform arc-length step. Returns (points, s)
+    where ``s`` is the cumulative arc length of the resampled points. This makes
+    mm-per-column constant so image proportions do not depend on the arch length."""
+    seg = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(s[-1])
+    if total <= 1e-6:
+        return points, s
+    n = max(4, int(round(total / max(step_mm, 1e-6))) + 1)
+    s_new = np.linspace(0.0, total, n)
+    resampled = np.column_stack([np.interp(s_new, s, points[:, k]) for k in range(3)])
+    return resampled, s_new
 
 
 @dataclass
@@ -683,6 +734,24 @@ def fit_unified_arch(
     upper_offset, v_upper = lateral_offsets(upper_base, fallback_v)
     lower_offset, v_lower = lateral_offsets(lower_base, fallback_v)
 
+    # The centerline (and every per-column array above) is sampled at uniform
+    # spline parameter u, whose mm-per-u varies along the arch — so as-is each
+    # output column would span a different physical width and the panorama would
+    # be laterally stretched where the spline runs slow, compressed where it runs
+    # fast. Resample to a constant arc-length step so every column is the same
+    # mm; carry the per-column offset/gain arrays onto the new grid by arc length.
+    seg_len = np.linalg.norm(np.diff(centerline, axis=0), axis=1)
+    s_old = np.concatenate([[0.0], np.cumsum(seg_len)])
+    centerline, s_new = _resample_arclength(centerline, config.column_spacing_mm)
+    if s_old[-1] > 1e-6:
+        upper_offset = np.interp(s_new, s_old, upper_offset)
+        lower_offset = np.interp(s_new, s_old, lower_offset)
+        column_slab_gain = np.interp(s_new, s_old, column_slab_gain)
+        # Re-derive the frame on the resampled centerline (more stable than
+        # interpolating unit vectors, which would need renormalization anyway).
+        tangent = _normalize(np.gradient(centerline, axis=0))
+        width_axis = _normalize(np.cross(vertical_axis[None, :].repeat(len(tangent), axis=0), tangent))
+
     # Per-arch curves themselves (re-extended) for debug plots.
     if upper_base is not None:
         upper_curve, *_ = _finalize_arch(upper_base, down_axis, n_ext, unified_base.mean_step_mm)
@@ -701,6 +770,7 @@ def fit_unified_arch(
         "v_separation_mm": float(abs(v_lower - v_upper)),
         "lateral_offset_upper_max_mm": float(np.max(np.abs(upper_offset))),
         "lateral_offset_lower_max_mm": float(np.max(np.abs(lower_offset))),
+        "column_spacing_mm": float(config.column_spacing_mm),
     }
 
     return ArchGeometry(
