@@ -9,6 +9,7 @@ env/
 # Data — kept local, not in history
 raw/
 seg/
+tests/
 
 # Run outputs (regenerable)
 outputs/
